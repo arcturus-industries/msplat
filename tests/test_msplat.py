@@ -4,6 +4,8 @@ import pytest
 import numpy as np
 import tempfile
 import os
+import platform
+import struct
 
 GARDEN = os.path.join(os.path.dirname(__file__), "..", "datasets", "mipnerf360", "garden")
 HAS_GARDEN = os.path.isdir(GARDEN)
@@ -15,9 +17,63 @@ HAS_GARDEN = os.path.isdir(GARDEN)
 def test_import():
     import msplat
     assert hasattr(msplat, "GaussianTrainer")
+    assert hasattr(msplat, "GaussianRenderer")
     assert hasattr(msplat, "TrainingConfig")
     assert hasattr(msplat, "Dataset")
     assert hasattr(msplat, "load_dataset")
+
+
+def _write_tiny_gaussian_ply(path):
+    c0 = 0.28209479177387814
+    header = "\n".join(
+        [
+            "ply",
+            "format binary_little_endian 1.0",
+            "element vertex 1",
+            "property float x",
+            "property float y",
+            "property float z",
+            "property float nx",
+            "property float ny",
+            "property float nz",
+            "property float f_dc_0",
+            "property float f_dc_1",
+            "property float f_dc_2",
+            "property float opacity",
+            "property float scale_0",
+            "property float scale_1",
+            "property float scale_2",
+            "property float rot_0",
+            "property float rot_1",
+            "property float rot_2",
+            "property float rot_3",
+            "end_header",
+            "",
+        ]
+    ).encode("ascii")
+    row = struct.pack(
+        "<17f",
+        0.0,
+        0.0,
+        -2.0,
+        0.0,
+        0.0,
+        0.0,
+        (1.0 - 0.5) / c0,
+        (0.2 - 0.5) / c0,
+        (0.1 - 0.5) / c0,
+        5.0,
+        np.log(0.25),
+        np.log(0.25),
+        np.log(0.25),
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+    )
+    with open(path, "wb") as f:
+        f.write(header)
+        f.write(row)
 
 
 def test_training_config_defaults():
@@ -131,6 +187,39 @@ def test_render():
     # Values should be in [0, 1] range (approximately)
     assert img.min() >= -0.1
     assert img.max() <= 1.5
+
+
+@pytest.mark.skipif(platform.system() != "Darwin", reason="GaussianRenderer requires Metal")
+def test_gaussian_renderer_from_ply():
+    """Render-only PLY API accepts explicit pose and intrinsics."""
+    from msplat import GaussianRenderer
+
+    with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as f:
+        path = f.name
+
+    try:
+        _write_tiny_gaussian_ply(path)
+        renderer = GaussianRenderer(path, bg_color=[0.0, 0.0, 0.0])
+        pose = np.eye(4, dtype=np.float32)
+        img = renderer.render(
+            pose,
+            64,
+            64,
+            48.0,
+            48.0,
+            32.0,
+            32.0,
+            max_sh_degree=0,
+        )
+
+        assert renderer.splat_count == 1
+        assert isinstance(img, np.ndarray)
+        assert img.dtype == np.float32
+        assert img.shape == (64, 64, 3)
+        assert np.isfinite(img).all()
+        assert img.max() > 0.0
+    finally:
+        os.unlink(path)
 
 
 # ── Export tests ─────────────────────────────────────────────────────────────

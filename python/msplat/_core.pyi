@@ -158,6 +158,38 @@ class GaussianTrainer:
         """Current training iteration."""
         ...
 
+class GaussianRenderer:
+    """Render-only 3D Gaussian Splatting PLY renderer. All computation runs on the Metal GPU."""
+
+    def __init__(
+        self,
+        ply_path: str,
+        bg_color: list[float] = ...,
+    ) -> None: ...
+
+    def render(
+        self,
+        cam_to_world: NDArray[np.float32],
+        width: int,
+        height: int,
+        fx: float,
+        fy: float,
+        cx: float,
+        cy: float,
+        max_sh_degree: int = 3,
+        bg_color: list[float] | None = None,
+    ) -> NDArray[np.float32]:
+        """Render from an arbitrary camera-to-world pose (4x4 row-major, OpenGL convention).
+
+        Uses explicit intrinsics and returns numpy (H, W, 3) float32 RGB [0,1].
+        """
+        ...
+
+    @property
+    def splat_count(self) -> int:
+        """Number of loaded Gaussians."""
+        ...
+
 def sync() -> None:
     """Synchronize GPU (wait for all commands to complete)."""
     ...

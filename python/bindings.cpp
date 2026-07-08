@@ -4,6 +4,7 @@
 #include <nanobind/stl/vector.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/function.h>
+#include <nanobind/stl/optional.h>
 
 #include "model.hpp"
 #include "input_data.hpp"
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include <numeric>
 #include <random>
+#include <optional>
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -279,6 +281,104 @@ public:
     }
 };
 
+// ── Render-only Gaussian PLY wrapper ────────────────────────────────────────
+
+class GaussianRenderer {
+public:
+    std::unique_ptr<Model> model;
+    std::vector<float> background;
+
+    GaussianRenderer(const std::string &ply_path, std::vector<float> bg_color)
+        : background(validate_bg_color(bg_color))
+    {
+        InputData input;
+        input.scale = 1.0f;
+        input.translation[0] = input.translation[1] = input.translation[2] = 0.0f;
+        input.points.count = 1;
+        input.points.xyz = {0.0f, 0.0f, -1.0f};
+        input.points.rgb = {255, 255, 255};
+
+        model = std::make_unique<Model>(
+            input,
+            1,
+            0,
+            1,
+            3,
+            1,
+            100,
+            500,
+            30,
+            0.0002f,
+            0.01f,
+            4000,
+            0.05f,
+            3,
+            false,
+            background.data()
+        );
+        model->loadPly(ply_path);
+    }
+
+    static std::vector<float> validate_bg_color(const std::vector<float> &bg_color) {
+        if (bg_color.size() != 3)
+            throw std::invalid_argument("bg_color must have exactly 3 elements [R, G, B]");
+        return bg_color;
+    }
+
+    void set_background(const std::vector<float> &bg_color) {
+        background = validate_bg_color(bg_color);
+        memcpy(model->backgroundColor.data_ptr(), background.data(), 3 * sizeof(float));
+    }
+
+    nb::object render(
+        nb::ndarray<nb::numpy, float> cam_to_world,
+        int width,
+        int height,
+        float fx,
+        float fy,
+        float cx,
+        float cy,
+        int max_sh_degree,
+        std::optional<std::vector<float>> bg_color
+    ) {
+        if (cam_to_world.size() != 16)
+            throw std::runtime_error("cam_to_world must have 16 elements (4x4 matrix)");
+        if (width <= 0 || height <= 0)
+            throw std::runtime_error("width and height must be positive");
+        if (fx <= 0.0f || fy <= 0.0f)
+            throw std::runtime_error("fx and fy must be positive");
+        if (bg_color.has_value())
+            set_background(bg_color.value());
+
+        Camera cam;
+        cam.width = width;
+        cam.height = height;
+        cam.fx = fx;
+        cam.fy = fy;
+        cam.cx = cx;
+        cam.cy = cy;
+        memcpy(cam.camToWorld, cam_to_world.data(), 16 * sizeof(float));
+
+        int degree_step = std::clamp(max_sh_degree, 0, model->shDegree);
+        MTensor rgb = model->render(cam, degree_step);
+        msplat_gpu_sync();
+        MTensor rgb_cpu = rgb.cpu();
+
+        int h = rgb_cpu.size(0);
+        int w = rgb_cpu.size(1);
+        float *buf = new float[h * w * 3];
+        memcpy(buf, rgb_cpu.data_ptr(), h * w * 3 * sizeof(float));
+
+        nb::capsule deleter(buf, [](void *p) noexcept { delete[] static_cast<float*>(p); });
+        size_t shape[3] = {(size_t)h, (size_t)w, 3};
+        return nb::cast(nb::ndarray<nb::numpy, float>(buf, 3, shape, deleter));
+    }
+
+    int splat_count() const {
+        return model->means.size(0);
+    }
+};
+
 // ── Module definition ───────────────────────────────────────────────────────
 
 NB_MODULE(_core, m) {
@@ -411,6 +511,19 @@ NB_MODULE(_core, m) {
             "Current number of active Gaussians.")
         .def_prop_ro("iteration", [](const GaussianTrainer &t) { return t.current_step; },
             "Current training iteration.");
+
+    nb::class_<GaussianRenderer>(m, "GaussianRenderer",
+            "Render-only 3D Gaussian Splatting PLY renderer. All computation runs on the Metal GPU.")
+        .def(nb::init<const std::string &, std::vector<float>>(),
+            "ply_path"_a, "bg_color"_a = std::vector<float>{0.0f, 0.0f, 0.0f})
+        .def("render", &GaussianRenderer::render,
+            "cam_to_world"_a, "width"_a, "height"_a,
+            "fx"_a, "fy"_a, "cx"_a, "cy"_a,
+            "max_sh_degree"_a = 3, "bg_color"_a = nb::none(),
+            "Render from an arbitrary camera-to-world pose (4x4 row-major, OpenGL convention).\n"
+            "Uses explicit intrinsics and returns numpy (H, W, 3) float32 RGB [0,1].")
+        .def_prop_ro("splat_count", &GaussianRenderer::splat_count,
+            "Number of loaded Gaussians.");
 
     // Utility
     m.def("sync", &msplat_gpu_sync, "Synchronize GPU (wait for all commands to complete)");

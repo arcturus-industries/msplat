@@ -7,6 +7,7 @@ from msplat._core import (
     TrainingStats,
     Dataset,
     GaussianTrainer,
+    GaussianRenderer,
     sync,
     cleanup as _cleanup_raw,
 )
@@ -29,6 +30,7 @@ __all__ = [
     "TrainingStats",
     "Dataset",
     "GaussianTrainer",
+    "GaussianRenderer",
     "sync",
     "cleanup",
     "load_dataset",

@@ -381,6 +381,7 @@ struct FusedTensorCache {
     MTensor v_mean3d, v_scale, v_quat, v_features_dc, v_features_rest;
 
     void ensure_forward(int np, int64_t cap, int ih, int iw, int nt,
+                        bool allocate_loss_buffers,
                         id<MTLDevice> dev) {
         if (np != fwd_num_points) {
             fwd_num_points = np;
@@ -405,9 +406,20 @@ struct FusedTensorCache {
             out_img = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
             final_Ts = mtensor_empty(dev, {ih, iw}, DType::Float32);
             final_idx = mtensor_empty(dev, {ih, iw}, DType::Int32);
+        }
+        bool needs_loss_buffers =
+            !loss_intermediates.defined() || !ssim_h_buf.defined() || !v_rendered.defined() ||
+            loss_intermediates.size(0) != ih || loss_intermediates.size(1) != iw ||
+            ssim_h_buf.size(0) != ih || ssim_h_buf.size(1) != iw ||
+            v_rendered.size(0) != ih || v_rendered.size(1) != iw;
+        if (allocate_loss_buffers && needs_loss_buffers) {
             loss_intermediates = mtensor_empty(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
             ssim_h_buf = mtensor_empty(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
             v_rendered = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+        } else if (!allocate_loss_buffers) {
+            loss_intermediates.reset();
+            ssim_h_buf.reset();
+            v_rendered.reset();
         }
         if (nt != num_tiles) {
             num_tiles = nt;
@@ -496,7 +508,7 @@ static void forward_pipeline(
     uint32_t channels = 3;
 
     // --- Cached buffer pool: only reallocate on dimension change (densification) ---
-    g_tcache.ensure_forward(num_points, capacity, img_height, img_width, num_tiles, ctx->device);
+    g_tcache.ensure_forward(num_points, capacity, img_height, img_width, num_tiles, compute_loss, ctx->device);
     MTensor &xys = g_tcache.xys;
     MTensor &depths = g_tcache.depths;
     MTensor &radii_out = g_tcache.radii_out;
@@ -811,7 +823,7 @@ std::tuple<MTensor, float> msplat_train_step(
     uint32_t channels = 3;
 
     // --- Cached buffer pool ---
-    g_tcache.ensure_forward(num_points, capacity, img_height, img_width, num_tiles, ctx->device);
+    g_tcache.ensure_forward(num_points, capacity, img_height, img_width, num_tiles, true, ctx->device);
     g_tcache.ensure_backward(num_points, features_rest_bases, ctx->device);
 
     MTensor &xys = g_tcache.xys;

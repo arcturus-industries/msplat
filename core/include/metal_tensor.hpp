@@ -5,6 +5,11 @@
 #include <cstdint>
 #include <cassert>
 #include <cstring>
+#include <utility>
+
+#ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>
+#endif
 
 // Forward-declare the Metal buffer type for C++ compatibility.
 // Full Metal/Metal.h is only needed in .mm files.
@@ -37,6 +42,62 @@ class MTensor {
 public:
     MTensor() = default;
 
+    ~MTensor() {
+        reset();
+    }
+
+    MTensor(const MTensor& other)
+        : _buffer(other._buffer),
+          _data(other._data),
+          _cpu_data(other._cpu_data),
+          _shape(other._shape),
+          _dtype(other._dtype),
+          _numel(other._numel) {
+        retainBuffer(_buffer);
+        if (!_buffer) _data = nullptr;
+    }
+
+    MTensor& operator=(const MTensor& other) {
+        if (this == &other) return *this;
+        reset();
+        _buffer = other._buffer;
+        retainBuffer(_buffer);
+        _data = other._data;
+        _cpu_data = other._cpu_data;
+        _shape = other._shape;
+        _dtype = other._dtype;
+        _numel = other._numel;
+        if (!_buffer) _data = nullptr;
+        return *this;
+    }
+
+    MTensor(MTensor&& other) noexcept
+        : _buffer(other._buffer),
+          _data(other._data),
+          _cpu_data(std::move(other._cpu_data)),
+          _shape(std::move(other._shape)),
+          _dtype(other._dtype),
+          _numel(other._numel) {
+        other._buffer = nullptr;
+        other._data = nullptr;
+        other._numel = 0;
+    }
+
+    MTensor& operator=(MTensor&& other) noexcept {
+        if (this == &other) return *this;
+        reset();
+        _buffer = other._buffer;
+        _data = other._data;
+        _cpu_data = std::move(other._cpu_data);
+        _shape = std::move(other._shape);
+        _dtype = other._dtype;
+        _numel = other._numel;
+        other._buffer = nullptr;
+        other._data = nullptr;
+        other._numel = 0;
+        return *this;
+    }
+
 #ifdef __OBJC__
     // GPU allocation (Objective-C++ only)
     MTensor(id<MTLDevice> device, std::vector<int64_t> shape, DType dtype)
@@ -46,7 +107,11 @@ public:
         size_t bytes = _numel * dtypeSize(_dtype);
         if (bytes == 0) bytes = 4;
         id<MTLBuffer> buf = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+#if __has_feature(objc_arc)
         _buffer = (__bridge_retained void*)buf;
+#else
+        _buffer = (__bridge void*)buf;
+#endif
         _data = [buf contents];  // cache CPU-accessible pointer for C++ access
     }
 
@@ -100,9 +165,7 @@ public:
     }
 
     void reset() {
-#ifdef __OBJC__
-        if (_buffer) { CFRelease(_buffer); }
-#endif
+        releaseBuffer(_buffer);
         _buffer = nullptr;
         _data = nullptr;
         _cpu_data.clear();
@@ -119,13 +182,13 @@ public:
     }
 
     // Create a view of the first `n` elements along dim 0.
-    // WARNING: Non-owning — shares the underlying MTLBuffer without retaining it.
-    // The caller MUST ensure the parent MTensor outlives all views.
-    // Use-after-free if the parent is destroyed while a view exists.
+    // Shares the underlying MTLBuffer while retaining it for this view.
     MTensor view(int64_t n) const {
         MTensor v;
-        v._buffer = _buffer;  // shares the buffer (non-owning)
+        v._buffer = _buffer;  // shares the buffer
+        retainBuffer(v._buffer);
         v._data = _data;      // shares the CPU-accessible pointer
+        if (!_buffer) v._cpu_data = _cpu_data;
         v._shape = _shape;
         v._shape[0] = n;
         v._dtype = _dtype;
@@ -134,6 +197,22 @@ public:
     }
 
 private:
+    static void retainBuffer(void* buffer) {
+#ifdef __APPLE__
+        if (buffer) CFRetain(static_cast<CFTypeRef>(buffer));
+#else
+        (void)buffer;
+#endif
+    }
+
+    static void releaseBuffer(void* buffer) {
+#ifdef __APPLE__
+        if (buffer) CFRelease(static_cast<CFTypeRef>(buffer));
+#else
+        (void)buffer;
+#endif
+    }
+
     void* _buffer = nullptr;  // retained id<MTLBuffer> as void*
     void* _data = nullptr;    // cached CPU-accessible pointer (shared memory on Apple Silicon)
     std::vector<uint8_t> _cpu_data;

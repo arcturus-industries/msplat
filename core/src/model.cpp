@@ -2,6 +2,7 @@
 #include <fstream>
 #include <iostream>
 #include <random>
+#include <utility>
 #include "model.hpp"
 #include "kdtree_tensor.hpp"
 #include "msplat.hpp"
@@ -325,6 +326,20 @@ int Model::loadPly(const std::string &filename){
     featuresRest = g.featuresRest;
     opacities = g.opacities;
     setupOptimizers();
+    return g.step;
+}
+
+int Model::loadPlyRenderOnly(const std::string &filename){
+    auto g = loadGaussianPly(filename, scale, translation, keepCrs);
+    releaseOptimizers();
+    means = std::move(g.means);
+    scales = std::move(g.scales);
+    quats = std::move(g.quats);
+    featuresDc = std::move(g.featuresDc);
+    featuresRest = std::move(g.featuresRest);
+    opacities = std::move(g.opacities);
+    num_active = means.size(0);
+    buf_capacity = num_active;
     return g.step;
 }
 

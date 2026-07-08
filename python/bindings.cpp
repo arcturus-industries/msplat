@@ -316,7 +316,7 @@ public:
             false,
             background.data()
         );
-        model->loadPly(ply_path);
+        model->loadPlyRenderOnly(ply_path);
     }
 
     static std::vector<float> validate_bg_color(const std::vector<float> &bg_color) {

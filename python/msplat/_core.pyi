@@ -186,6 +186,20 @@ class GaussianRenderer:
         """
         ...
 
+    def render_depth(
+        self,
+        cam_to_world: NDArray[np.float32],
+        width: int,
+        height: int,
+        fx: float,
+        fy: float,
+        cx: float,
+        cy: float,
+        max_sh_degree: int = 3,
+    ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+        """Render expected positive view-space depth and alpha."""
+        ...
+
     @property
     def splat_count(self) -> int:
         """Number of loaded Gaussians."""

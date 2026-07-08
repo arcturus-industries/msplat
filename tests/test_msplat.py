@@ -280,6 +280,43 @@ def test_gaussian_renderer_from_ply():
         os.unlink(path)
 
 
+
+
+@pytest.mark.skipif(platform.system() != "Darwin", reason="GaussianRenderer requires Metal")
+def test_gaussian_renderer_render_depth_from_ply():
+    """Render-only PLY API can produce expected depth and alpha."""
+    from msplat import GaussianRenderer
+
+    with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as f:
+        path = f.name
+
+    try:
+        _write_tiny_gaussian_ply(path)
+        renderer = GaussianRenderer(path, bg_color=[0.0, 0.0, 0.0], overflow_mode="exact")
+        pose = np.eye(4, dtype=np.float32)
+        depth, alpha = renderer.render_depth(
+            pose,
+            64,
+            64,
+            48.0,
+            48.0,
+            32.0,
+            32.0,
+            max_sh_degree=0,
+        )
+
+        assert depth.dtype == np.float32
+        assert alpha.dtype == np.float32
+        assert depth.shape == (64, 64)
+        assert alpha.shape == (64, 64)
+        assert np.isfinite(depth).all()
+        assert np.isfinite(alpha).all()
+        assert alpha.max() > 0.0
+        assert depth[alpha > 0.05].max() > 0.0
+    finally:
+        os.unlink(path)
+
+
 @pytest.mark.skipif(platform.system() != "Darwin", reason="GaussianRenderer requires Metal")
 def test_gaussian_renderer_exact_overflow_mode_repairs_tiles():
     """Exact overflow mode rerenders tiles that exceed the fast-path bin limit."""
@@ -315,6 +352,34 @@ def test_gaussian_renderer_exact_overflow_mode_repairs_tiles():
         assert overflow_fallback_count() >= 1
         assert last_overflow_tile_count() >= 1
         assert last_overflow_max_tile_count() >= 3000
+    finally:
+        os.unlink(path)
+
+
+@pytest.mark.skipif(platform.system() != "Darwin", reason="GaussianRenderer requires Metal")
+def test_gaussian_renderer_exact_depth_does_not_pollute_rgb_state():
+    """Depth exact-overflow fallback must not corrupt following RGB renders."""
+    from msplat import GaussianRenderer, reset_overflow_fallback_count
+
+    with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as f:
+        path = f.name
+
+    try:
+        _write_overflow_gaussian_ply(path, count=3000)
+        reset_overflow_fallback_count()
+        renderer = GaussianRenderer(path, bg_color=[0.0, 0.0, 0.0], overflow_mode="exact")
+        pose = np.eye(4, dtype=np.float32)
+        rgb_args = (pose, 64, 64, 48.0, 48.0, 32.0, 32.0)
+        depth_args = (pose, 32, 32, 24.0, 24.0, 16.0, 16.0)
+
+        rgb_before = renderer.render(*rgb_args, max_sh_degree=0)
+        depth, alpha = renderer.render_depth(*depth_args, max_sh_degree=0)
+        rgb_after = renderer.render(*rgb_args, max_sh_degree=0)
+
+        assert np.isfinite(depth).all()
+        assert np.isfinite(alpha).all()
+        assert np.isfinite(rgb_after).all()
+        np.testing.assert_allclose(rgb_after, rgb_before, rtol=0.0, atol=1e-6)
     finally:
         os.unlink(path)
 

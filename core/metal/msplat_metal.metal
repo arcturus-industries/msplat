@@ -675,6 +675,166 @@ kernel void nd_rasterize_forward_overflow_tiles_kernel(
     }
 }
 
+
+kernel void nd_rasterize_depth_kernel(
+    constant uint3& tile_bounds,
+    constant uint3& img_size,
+    constant int* tile_bins,
+    constant float* packed_xy_opac,
+    constant float* packed_conic,
+    constant int* gaussian_ids,
+    constant float* depths,
+    device float* out_depth,
+    device float* out_alpha,
+    constant uint2& blockDim,
+    uint2 blockIdx [[threadgroup_position_in_grid]],
+    uint2 threadIdx [[thread_position_in_threadgroup]],
+    uint tr [[thread_index_in_threadgroup]]
+) {
+    int32_t i = blockIdx.y * blockDim.y + threadIdx.y;
+    int32_t j = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool inside = (i < (int)img_size.y && j < (int)img_size.x);
+    if (!inside) return;
+
+    int32_t tile_id = (i / BLOCK_Y) * tile_bounds.x + (j / BLOCK_X);
+    float px = (float)j;
+    float py = (float)i;
+    int32_t pix_id = i * (int)img_size.x + j;
+
+    int2 range = read_packed_int2(tile_bins, tile_id);
+    const int num_batches = (range.y - range.x + RAST_BLOCK_SIZE - 1) / RAST_BLOCK_SIZE;
+
+    threadgroup float3 xy_opacity_batch[RAST_BLOCK_SIZE];
+    threadgroup float3 conic_batch[RAST_BLOCK_SIZE];
+    threadgroup float depth_batch[RAST_BLOCK_SIZE];
+
+    float T = 1.f;
+    float depth_sum = 0.f;
+    bool done = false;
+
+    for (int b = 0; b < num_batches; ++b) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        int batch_start = range.x + RAST_BLOCK_SIZE * b;
+        int idx = batch_start + tr;
+        if (idx < range.y) {
+            xy_opacity_batch[tr] = read_packed_float3(packed_xy_opac, idx);
+            conic_batch[tr] = read_packed_float3(packed_conic, idx);
+            int g_id = gaussian_ids[idx];
+            depth_batch[tr] = depths[g_id];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (done) continue;
+
+        int batch_size = min(RAST_BLOCK_SIZE, range.y - batch_start);
+        for (int t = 0; t < batch_size; ++t) {
+            const float3 conic_local = conic_batch[t];
+            const float3 xy_opac = xy_opacity_batch[t];
+            const float2 delta = {xy_opac.x - px, xy_opac.y - py};
+            const float sigma = fma(0.5f,
+                fma(conic_local.x, delta.x * delta.x, conic_local.z * delta.y * delta.y),
+                conic_local.y * delta.x * delta.y);
+            if (sigma < 0.f || sigma >= 5.55f) continue;
+            const float alpha = min(0.999f, xy_opac.z * exp(-sigma));
+            if (alpha < 1.f / 255.f) continue;
+            const float next_T = T * (1.f - alpha);
+            if (next_T <= 1e-4f) {
+                done = true;
+                break;
+            }
+            const float vis = alpha * T;
+            depth_sum = fma(depth_batch[t], vis, depth_sum);
+            T = next_T;
+        }
+    }
+
+    float alpha_out = 1.f - T;
+    out_alpha[pix_id] = alpha_out;
+    out_depth[pix_id] = alpha_out > 1e-6f ? depth_sum / alpha_out : 0.f;
+}
+
+kernel void nd_rasterize_depth_overflow_tiles_kernel(
+    constant uint3& tile_bounds,
+    constant uint3& img_size,
+    constant int* tile_bins,
+    constant float* packed_xy_opac,
+    constant float* packed_conic,
+    constant int* gaussian_ids,
+    constant float* depths,
+    device float* out_depth,
+    device float* out_alpha,
+    constant uint2& blockDim,
+    device atomic_uint* overflow_tile_flags,
+    uint2 blockIdx [[threadgroup_position_in_grid]],
+    uint2 threadIdx [[thread_position_in_threadgroup]],
+    uint tr [[thread_index_in_threadgroup]]
+) {
+    int32_t i = blockIdx.y * blockDim.y + threadIdx.y;
+    int32_t j = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool inside = (i < (int)img_size.y && j < (int)img_size.x);
+    if (!inside) return;
+
+    int32_t tile_id = (i / BLOCK_Y) * tile_bounds.x + (j / BLOCK_X);
+    if (atomic_load_explicit(&overflow_tile_flags[tile_id], memory_order_relaxed) == 0) {
+        return;
+    }
+
+    float px = (float)j;
+    float py = (float)i;
+    int32_t pix_id = i * (int)img_size.x + j;
+
+    int2 range = read_packed_int2(tile_bins, tile_id);
+    const int num_batches = (range.y - range.x + RAST_BLOCK_SIZE - 1) / RAST_BLOCK_SIZE;
+
+    threadgroup float3 xy_opacity_batch[RAST_BLOCK_SIZE];
+    threadgroup float3 conic_batch[RAST_BLOCK_SIZE];
+    threadgroup float depth_batch[RAST_BLOCK_SIZE];
+
+    float T = 1.f;
+    float depth_sum = 0.f;
+    bool done = false;
+
+    for (int b = 0; b < num_batches; ++b) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        int batch_start = range.x + RAST_BLOCK_SIZE * b;
+        int idx = batch_start + tr;
+        if (idx < range.y) {
+            xy_opacity_batch[tr] = read_packed_float3(packed_xy_opac, idx);
+            conic_batch[tr] = read_packed_float3(packed_conic, idx);
+            int g_id = gaussian_ids[idx];
+            depth_batch[tr] = depths[g_id];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (done) continue;
+
+        int batch_size = min(RAST_BLOCK_SIZE, range.y - batch_start);
+        for (int t = 0; t < batch_size; ++t) {
+            const float3 conic_local = conic_batch[t];
+            const float3 xy_opac = xy_opacity_batch[t];
+            const float2 delta = {xy_opac.x - px, xy_opac.y - py};
+            const float sigma = fma(0.5f,
+                fma(conic_local.x, delta.x * delta.x, conic_local.z * delta.y * delta.y),
+                conic_local.y * delta.x * delta.y);
+            if (sigma < 0.f || sigma >= 5.55f) continue;
+            const float alpha = min(0.999f, xy_opac.z * exp(-sigma));
+            if (alpha < 1.f / 255.f) continue;
+            const float next_T = T * (1.f - alpha);
+            if (next_T <= 1e-4f) {
+                done = true;
+                break;
+            }
+            const float vis = alpha * T;
+            depth_sum = fma(depth_batch[t], vis, depth_sum);
+            T = next_T;
+        }
+    }
+
+    float alpha_out = 1.f - T;
+    out_alpha[pix_id] = alpha_out;
+    out_depth[pix_id] = alpha_out > 1e-6f ? depth_sum / alpha_out : 0.f;
+}
+
 void sh_coeffs_to_color(
     const uint degree,
     const float3 viewdir,

@@ -138,6 +138,8 @@ struct MetalContext {
     id<MTLComputePipelineState> project_and_sh_forward_kernel_cpso;
     id<MTLComputePipelineState> nd_rasterize_forward_kernel_cpso;
     id<MTLComputePipelineState> nd_rasterize_forward_overflow_tiles_kernel_cpso;
+    id<MTLComputePipelineState> nd_rasterize_depth_kernel_cpso;
+    id<MTLComputePipelineState> nd_rasterize_depth_overflow_tiles_kernel_cpso;
     // Tile-local sorting
     id<MTLComputePipelineState> scatter_to_prealloc_bins_kernel_cpso;
     id<MTLComputePipelineState> bitonic_sort_per_tile_kernel_cpso;
@@ -244,6 +246,8 @@ MetalContext* init_msplat_metal_context() {
     ctx->project_and_sh_forward_kernel_cpso       = load(@"project_and_sh_forward_kernel");
     ctx->nd_rasterize_forward_kernel_cpso         = load(@"nd_rasterize_forward_kernel");
     ctx->nd_rasterize_forward_overflow_tiles_kernel_cpso = load(@"nd_rasterize_forward_overflow_tiles_kernel");
+    ctx->nd_rasterize_depth_kernel_cpso           = load(@"nd_rasterize_depth_kernel");
+    ctx->nd_rasterize_depth_overflow_tiles_kernel_cpso = load(@"nd_rasterize_depth_overflow_tiles_kernel");
     // Tile-local sorting
     ctx->scatter_to_prealloc_bins_kernel_cpso      = load(@"scatter_to_prealloc_bins_kernel");
     ctx->bitonic_sort_per_tile_kernel_cpso        = load(@"bitonic_sort_per_tile_kernel");
@@ -370,6 +374,7 @@ struct FusedTensorCache {
     MTensor gaussian_ids;
     MTensor packed_xy_opac, packed_conic, packed_rgb;
     MTensor out_img, final_Ts, final_idx;
+    MTensor out_depth, out_alpha;
     MTensor loss_intermediates;
     MTensor ssim_h_buf;
     MTensor tile_bins, loss_sum;
@@ -389,8 +394,19 @@ struct FusedTensorCache {
     // Depth-chunked rasterization buffers
     uint32_t current_K_max = 1;
     int chunk_K_max = 0;
+    int chunk_img_height = 0;
+    int chunk_img_width = 0;
     MTensor chunk_T, chunk_C, chunk_final_idx;
     MTensor prefix_T, after_C;
+
+    // CPU exact-overflow fallback scratch. Keep this separate from the normal
+    // forward packed buffers so fallback rerenders cannot poison later renders.
+    int64_t exact_capacity = 0;
+    int exact_num_tiles = 0;
+    bool exact_has_rgb = false;
+    MTensor exact_gaussian_ids;
+    MTensor exact_packed_xy_opac, exact_packed_conic, exact_packed_rgb;
+    MTensor exact_tile_bins;
 
     // Backward gradient accumulators
     MTensor v_rendered;
@@ -458,13 +474,41 @@ struct FusedTensorCache {
     }
 
     void ensure_chunks(int K, int ih, int iw, id<MTLDevice> dev) {
-        if (K <= chunk_K_max && ih == img_height && iw == img_width) return;
+        if (K <= chunk_K_max && ih == chunk_img_height && iw == chunk_img_width) return;
         chunk_K_max = K;
+        chunk_img_height = ih;
+        chunk_img_width = iw;
         chunk_T = mtensor_empty(dev, {K, ih, iw}, DType::Float32);
         chunk_C = mtensor_empty(dev, {K, ih, iw, 3}, DType::Float32);
         chunk_final_idx = mtensor_empty(dev, {K, ih, iw}, DType::Int32);
         prefix_T = mtensor_empty(dev, {K, ih, iw}, DType::Float32);
         after_C = mtensor_empty(dev, {K, ih, iw, 3}, DType::Float32);
+    }
+
+    void ensure_exact_overflow(int64_t cap, int nt, bool need_rgb, id<MTLDevice> dev) {
+        if (cap > exact_capacity || !exact_gaussian_ids.defined()) {
+            exact_capacity = cap;
+            exact_gaussian_ids = mtensor_empty(dev, {cap}, DType::Int32);
+            exact_packed_xy_opac = mtensor_empty(dev, {cap, 3}, DType::Float32);
+            exact_packed_conic = mtensor_empty(dev, {cap, 3}, DType::Float32);
+            exact_packed_rgb.reset();
+            exact_has_rgb = false;
+        }
+        if (need_rgb && (!exact_packed_rgb.defined() || !exact_has_rgb || cap > exact_capacity)) {
+            exact_packed_rgb = mtensor_empty(dev, {exact_capacity, 3}, DType::Float32);
+            exact_has_rgb = true;
+        }
+        if (nt != exact_num_tiles || !exact_tile_bins.defined()) {
+            exact_num_tiles = nt;
+            exact_tile_bins = mtensor_empty(dev, {nt, 2}, DType::Int32);
+        }
+    }
+
+    void ensure_depth_outputs(int ih, int iw, id<MTLDevice> dev) {
+        if (!out_depth.defined() || out_depth.size(0) != ih || out_depth.size(1) != iw) {
+            out_depth = mtensor_empty(dev, {ih, iw}, DType::Float32);
+            out_alpha = mtensor_empty(dev, {ih, iw}, DType::Float32);
+        }
     }
 
     void ensure_backward(int np, int frb, id<MTLDevice> dev) {
@@ -492,6 +536,7 @@ struct PendingRenderFallback {
     uint32_t tile_bounds_x = 0, tile_bounds_y = 0, tile_bounds_z = 1;
     MTensor* opacities = nullptr;
     MTensor* background = nullptr;
+    bool render_depth = false;
 };
 
 static PendingRenderFallback g_pending_render_fallback;
@@ -609,9 +654,8 @@ static uint32_t build_exact_overflow_bins_cpu(
         return 0;
     }
 
-    g_tcache.ensure_forward(
-        num_points, total_intersections,
-        pending.img_height, pending.img_width, num_tiles, false, ctx->device);
+    g_tcache.ensure_exact_overflow(
+        total_intersections, num_tiles, !pending.render_depth, ctx->device);
 
     std::vector<CpuTileIntersection> intersections;
     intersections.reserve((size_t)total_intersections);
@@ -641,11 +685,11 @@ static uint32_t build_exact_overflow_bins_cpu(
                   return a.gaussian_id < b.gaussian_id;
               });
 
-    int* tile_bins = g_tcache.tile_bins.data<int>();
-    int32_t* gaussian_ids = g_tcache.gaussian_ids.data<int32_t>();
-    float* packed_xy_opac = g_tcache.packed_xy_opac.data<float>();
-    float* packed_conic = g_tcache.packed_conic.data<float>();
-    float* packed_rgb = g_tcache.packed_rgb.data<float>();
+    int* tile_bins = g_tcache.exact_tile_bins.data<int>();
+    int32_t* gaussian_ids = g_tcache.exact_gaussian_ids.data<int32_t>();
+    float* packed_xy_opac = g_tcache.exact_packed_xy_opac.data<float>();
+    float* packed_conic = g_tcache.exact_packed_conic.data<float>();
+    float* packed_rgb = pending.render_depth ? nullptr : g_tcache.exact_packed_rgb.data<float>();
     const float* conics = g_tcache.conics.data<float>();
     const float* colors = g_tcache.colors.data<float>();
     const float* opacities = pending.opacities->data<float>();
@@ -668,9 +712,11 @@ static uint32_t build_exact_overflow_bins_cpu(
         packed_conic[3 * i + 0] = conics[3 * g + 0];
         packed_conic[3 * i + 1] = conics[3 * g + 1];
         packed_conic[3 * i + 2] = conics[3 * g + 2];
-        packed_rgb[3 * i + 0] = colors[3 * g + 0];
-        packed_rgb[3 * i + 1] = colors[3 * g + 1];
-        packed_rgb[3 * i + 2] = colors[3 * g + 2];
+        if (packed_rgb) {
+            packed_rgb[3 * i + 0] = colors[3 * g + 0];
+            packed_rgb[3 * i + 1] = colors[3 * g + 1];
+            packed_rgb[3 * i + 2] = colors[3 * g + 2];
+        }
     }
     if (prev_tile >= 0) tile_bins[2 * prev_tile + 1] = (int)intersections.size();
 
@@ -706,16 +752,30 @@ static void encode_exact_overflow_raster(
         id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
         assert(enc && "Failed to create compute command encoder");
 
-        if (K_max <= 1) {
+        if (pending.render_depth) {
+            MTLSize num_tg = MTLSizeMake(
+                (pending.img_width + RAST_BLOCK_X - 1) / RAST_BLOCK_X,
+                (pending.img_height + RAST_BLOCK_Y - 1) / RAST_BLOCK_Y, 1);
+            [enc setComputePipelineState:ctx->nd_rasterize_depth_overflow_tiles_kernel_cpso];
+            [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:0];
+            [enc setBytes:img_size_dim3->data() length:sizeof(*img_size_dim3) atIndex:1];
+            ENC_BUF(enc, g_tcache.exact_tile_bins, 2);
+            ENC_BUF(enc, g_tcache.exact_packed_xy_opac, 3); ENC_BUF(enc, g_tcache.exact_packed_conic, 4);
+            ENC_BUF(enc, g_tcache.exact_gaussian_ids, 5); ENC_BUF(enc, g_tcache.depths, 6);
+            ENC_BUF(enc, g_tcache.out_depth, 7); ENC_BUF(enc, g_tcache.out_alpha, 8);
+            [enc setBytes:block_size_dim2->data() length:sizeof(*block_size_dim2) atIndex:9];
+            ENC_BUF(enc, g_tcache.overflow_tile_flags, 10);
+            [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
+        } else if (K_max <= 1) {
             MTLSize num_tg = MTLSizeMake(
                 (pending.img_width + RAST_BLOCK_X - 1) / RAST_BLOCK_X,
                 (pending.img_height + RAST_BLOCK_Y - 1) / RAST_BLOCK_Y, 1);
             [enc setComputePipelineState:ctx->nd_rasterize_forward_overflow_tiles_kernel_cpso];
             [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:0];
             [enc setBytes:img_size_dim3->data() length:sizeof(*img_size_dim3) atIndex:1];
-            ENC_SCALAR(enc, channels, 2); ENC_BUF(enc, g_tcache.tile_bins, 3);
-            ENC_BUF(enc, g_tcache.packed_xy_opac, 4); ENC_BUF(enc, g_tcache.packed_conic, 5);
-            ENC_BUF(enc, g_tcache.packed_rgb, 6);
+            ENC_SCALAR(enc, channels, 2); ENC_BUF(enc, g_tcache.exact_tile_bins, 3);
+            ENC_BUF(enc, g_tcache.exact_packed_xy_opac, 4); ENC_BUF(enc, g_tcache.exact_packed_conic, 5);
+            ENC_BUF(enc, g_tcache.exact_packed_rgb, 6);
             ENC_BUF(enc, g_tcache.final_Ts, 7); ENC_BUF(enc, g_tcache.final_idx, 8);
             ENC_BUF(enc, g_tcache.out_img, 9);
             [enc setBuffer:pending.background->buffer() offset:0 atIndex:10];
@@ -733,9 +793,9 @@ static void encode_exact_overflow_raster(
             [enc setComputePipelineState:ctx->rasterize_forward_chunked_overflow_tiles_kernel_cpso];
             [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:0];
             [enc setBytes:img_size_dim3->data() length:sizeof(*img_size_dim3) atIndex:1];
-            ENC_SCALAR(enc, channels, 2); ENC_BUF(enc, g_tcache.tile_bins, 3);
-            ENC_BUF(enc, g_tcache.packed_xy_opac, 4); ENC_BUF(enc, g_tcache.packed_conic, 5);
-            ENC_BUF(enc, g_tcache.packed_rgb, 6);
+            ENC_SCALAR(enc, channels, 2); ENC_BUF(enc, g_tcache.exact_tile_bins, 3);
+            ENC_BUF(enc, g_tcache.exact_packed_xy_opac, 4); ENC_BUF(enc, g_tcache.exact_packed_conic, 5);
+            ENC_BUF(enc, g_tcache.exact_packed_rgb, 6);
             ENC_BUF(enc, g_tcache.chunk_T, 7); ENC_BUF(enc, g_tcache.chunk_C, 8);
             ENC_BUF(enc, g_tcache.chunk_final_idx, 9);
             ENC_SCALAR(enc, CHUNK_SIZE, 10); ENC_SCALAR(enc, K_max, 11);
@@ -817,7 +877,8 @@ static void forward_pipeline(
     MTensor &features_dc, MTensor &features_rest,
     MTensor &opacities, MTensor &background,
     MTensor &gt, MTensor &window2d, float ssim_weight,
-    bool compute_loss
+    bool compute_loss,
+    bool render_depth_outputs = false
 ) {
     MetalContext* ctx = get_global_context();
     int tile_bounds_x = std::get<0>(tile_bounds);
@@ -845,6 +906,9 @@ static void forward_pipeline(
 
     // --- Cached buffer pool: only reallocate on dimension change (densification) ---
     g_tcache.ensure_forward(num_points, capacity, img_height, img_width, num_tiles, compute_loss, ctx->device);
+    if (render_depth_outputs) {
+        g_tcache.ensure_depth_outputs(img_height, img_width, ctx->device);
+    }
     MTensor &xys = g_tcache.xys;
     MTensor &depths = g_tcache.depths;
     MTensor &radii_out = g_tcache.radii_out;
@@ -1016,6 +1080,21 @@ static void forward_pipeline(
         }
     };
 
+    auto encode_rast_depth = [&](id<MTLComputeCommandEncoder> enc) {
+        MTLSize num_tg = MTLSizeMake((img_width + RAST_BLOCK_X - 1) / RAST_BLOCK_X,
+                                     (img_height + RAST_BLOCK_Y - 1) / RAST_BLOCK_Y, 1);
+        MTLSize tg_size = MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1);
+        [enc setComputePipelineState:ctx->nd_rasterize_depth_kernel_cpso];
+        [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:0];
+        [enc setBytes:img_size_dim3->data() length:sizeof(*img_size_dim3) atIndex:1];
+        ENC_BUF(enc, tile_bins, 2); ENC_BUF(enc, packed_xy_opac, 3);
+        ENC_BUF(enc, packed_conic, 4); ENC_BUF(enc, gaussian_ids, 5);
+        ENC_BUF(enc, depths, 6); ENC_BUF(enc, g_tcache.out_depth, 7);
+        ENC_BUF(enc, g_tcache.out_alpha, 8);
+        [enc setBytes:block_size_dim2->data() length:sizeof(*block_size_dim2) atIndex:9];
+        [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:tg_size];
+    };
+
     auto encode_loss_fwd = [&](id<MTLComputeCommandEncoder> enc) {
         // Separable SSIM forward: H conv → barrier → V conv + SSIM + reduction
         MTLSize grid = MTLSizeMake(img_width, img_height, 1);
@@ -1086,7 +1165,11 @@ static void forward_pipeline(
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             encode_prefix_map(encoder);
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            encode_rast_fwd(encoder);
+            if (render_depth_outputs) {
+                encode_rast_depth(encoder);
+            } else {
+                encode_rast_fwd(encoder);
+            }
             if (compute_loss) {
                 [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 encode_loss_fwd(encoder);
@@ -1115,7 +1198,7 @@ MTensor msplat_render(
         quats, viewmat, projmat, fx, fy, cx, cy,
         img_height, img_width, tile_bounds, clip_thresh,
         degree, degrees_to_use, cam_pos, features_dc, features_rest,
-        opacities, background, dummyGt, dummyWindow, 0.0f, false);
+        opacities, background, dummyGt, dummyWindow, 0.0f, false, false);
     if (exact_overflow) {
         g_pending_render_fallback.active = true;
         g_pending_render_fallback.img_height = img_height;
@@ -1125,10 +1208,44 @@ MTensor msplat_render(
         g_pending_render_fallback.tile_bounds_z = (uint32_t)std::get<2>(tile_bounds);
         g_pending_render_fallback.opacities = &opacities;
         g_pending_render_fallback.background = &background;
+        g_pending_render_fallback.render_depth = false;
     } else {
         g_pending_render_fallback.active = false;
     }
     return g_tcache.out_img;
+}
+
+std::tuple<MTensor, MTensor> msplat_render_depth(
+    int num_points, MTensor &means3d, MTensor &scales, float glob_scale,
+    MTensor &quats, MTensor &viewmat, MTensor &projmat,
+    float fx, float fy, float cx, float cy,
+    unsigned img_height, unsigned img_width,
+    const std::tuple<int, int, int> tile_bounds, float clip_thresh,
+    unsigned degree, unsigned degrees_to_use, float cam_pos[3],
+    MTensor &features_dc, MTensor &features_rest,
+    MTensor &opacities, MTensor &background,
+    bool exact_overflow
+) {
+    MTensor dummyGt, dummyWindow;
+    forward_pipeline(num_points, means3d, scales, glob_scale,
+        quats, viewmat, projmat, fx, fy, cx, cy,
+        img_height, img_width, tile_bounds, clip_thresh,
+        degree, degrees_to_use, cam_pos, features_dc, features_rest,
+        opacities, background, dummyGt, dummyWindow, 0.0f, false, true);
+    if (exact_overflow) {
+        g_pending_render_fallback.active = true;
+        g_pending_render_fallback.img_height = img_height;
+        g_pending_render_fallback.img_width = img_width;
+        g_pending_render_fallback.tile_bounds_x = (uint32_t)std::get<0>(tile_bounds);
+        g_pending_render_fallback.tile_bounds_y = (uint32_t)std::get<1>(tile_bounds);
+        g_pending_render_fallback.tile_bounds_z = (uint32_t)std::get<2>(tile_bounds);
+        g_pending_render_fallback.opacities = &opacities;
+        g_pending_render_fallback.background = &background;
+        g_pending_render_fallback.render_depth = true;
+    } else {
+        g_pending_render_fallback.active = false;
+    }
+    return {g_tcache.out_depth, g_tcache.out_alpha};
 }
 
 std::tuple<MTensor, float> msplat_train_step(

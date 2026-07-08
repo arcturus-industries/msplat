@@ -4,6 +4,7 @@
 #include "metal_tensor.hpp"
 #include "ssim.hpp"
 #include "input_data.hpp"
+#include <tuple>
 
 int numShBases(int degree);
 float psnr(const MTensor& rendered, const MTensor& gt);
@@ -40,6 +41,7 @@ struct Model{
   CamSetup prepareCam(Camera& cam, int step);
   void fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight);
   MTensor render(Camera& cam, int step, bool exactOverflow = false);
+  std::tuple<MTensor, MTensor> renderDepth(Camera& cam, int step, bool exactOverflow = false);
 
   MTensor means;
   MTensor scales;

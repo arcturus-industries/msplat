@@ -17,6 +17,7 @@
 #include <numeric>
 #include <random>
 #include <optional>
+#include <tuple>
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -326,6 +327,19 @@ public:
         return bg_color;
     }
 
+
+    static nb::object tensor_to_numpy_2d(MTensor &tensor) {
+        MTensor tensor_cpu = tensor.cpu();
+        int h = tensor_cpu.size(0);
+        int w = tensor_cpu.size(1);
+        float *buf = new float[h * w];
+        memcpy(buf, tensor_cpu.data_ptr(), h * w * sizeof(float));
+
+        nb::capsule deleter(buf, [](void *p) noexcept { delete[] static_cast<float*>(p); });
+        size_t shape[2] = {(size_t)h, (size_t)w};
+        return nb::cast(nb::ndarray<nb::numpy, float>(buf, 2, shape, deleter));
+    }
+
     static bool validate_overflow_mode(const std::string &overflow_mode) {
         if (overflow_mode == "fast") return false;
         if (overflow_mode == "exact") return true;
@@ -379,6 +393,40 @@ public:
         nb::capsule deleter(buf, [](void *p) noexcept { delete[] static_cast<float*>(p); });
         size_t shape[3] = {(size_t)h, (size_t)w, 3};
         return nb::cast(nb::ndarray<nb::numpy, float>(buf, 3, shape, deleter));
+    }
+
+    nb::tuple render_depth(
+        nb::ndarray<nb::numpy, float> cam_to_world,
+        int width,
+        int height,
+        float fx,
+        float fy,
+        float cx,
+        float cy,
+        int max_sh_degree
+    ) {
+        if (cam_to_world.size() != 16)
+            throw std::runtime_error("cam_to_world must have 16 elements (4x4 matrix)");
+        if (width <= 0 || height <= 0)
+            throw std::runtime_error("width and height must be positive");
+        if (fx <= 0.0f || fy <= 0.0f)
+            throw std::runtime_error("fx and fy must be positive");
+
+        Camera cam;
+        cam.width = width;
+        cam.height = height;
+        cam.fx = fx;
+        cam.fy = fy;
+        cam.cx = cx;
+        cam.cy = cy;
+        memcpy(cam.camToWorld, cam_to_world.data(), 16 * sizeof(float));
+
+        int degree_step = std::clamp(max_sh_degree, 0, model->shDegree);
+        auto rendered = model->renderDepth(cam, degree_step, exact_overflow);
+        msplat_gpu_sync();
+        MTensor depth = std::get<0>(rendered);
+        MTensor alpha = std::get<1>(rendered);
+        return nb::make_tuple(tensor_to_numpy_2d(depth), tensor_to_numpy_2d(alpha));
     }
 
     int splat_count() const {
@@ -530,6 +578,12 @@ NB_MODULE(_core, m) {
             "max_sh_degree"_a = 3, "bg_color"_a = nb::none(),
             "Render from an arbitrary camera-to-world pose (4x4 row-major, OpenGL convention).\n"
             "Uses explicit intrinsics and returns numpy (H, W, 3) float32 RGB [0,1].")
+        .def("render_depth", &GaussianRenderer::render_depth,
+            "cam_to_world"_a, "width"_a, "height"_a,
+            "fx"_a, "fy"_a, "cx"_a, "cy"_a,
+            "max_sh_degree"_a = 3,
+            "Render expected positive view-space depth and alpha from an OpenGL camera-to-world pose.\n"
+            "Returns (depth, alpha) numpy arrays with shape (H, W), float32.")
         .def_prop_ro("splat_count", &GaussianRenderer::splat_count,
             "Number of loaded Gaussians.");
 

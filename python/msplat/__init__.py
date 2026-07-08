@@ -9,6 +9,11 @@ from msplat._core import (
     GaussianTrainer,
     GaussianRenderer,
     sync,
+    overflow_fallback_count,
+    overflow_tile_event_count,
+    last_overflow_tile_count,
+    last_overflow_max_tile_count,
+    reset_overflow_fallback_count,
     cleanup as _cleanup_raw,
 )
 
@@ -32,6 +37,11 @@ __all__ = [
     "GaussianTrainer",
     "GaussianRenderer",
     "sync",
+    "overflow_fallback_count",
+    "overflow_tile_event_count",
+    "last_overflow_tile_count",
+    "last_overflow_max_tile_count",
+    "reset_overflow_fallback_count",
     "cleanup",
     "load_dataset",
 ]

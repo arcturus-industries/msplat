@@ -1,6 +1,7 @@
 #ifndef MSPLAT_BINDINGS_H
 #define MSPLAT_BINDINGS_H
 
+#include <cstdint>
 #include <tuple>
 #include "metal_tensor.hpp"
 
@@ -24,6 +25,12 @@ void msplat_commit();
 // Synchronize (commit + wait for completion)
 void msplat_gpu_sync();
 
+uint64_t msplat_overflow_fallback_count();
+uint64_t msplat_overflow_tile_event_count();
+uint32_t msplat_last_overflow_tile_count();
+uint32_t msplat_last_overflow_max_tile_count();
+void msplat_reset_overflow_fallback_count();
+
 // GPU timing — non-invasive, uses completion handlers on committed CBs
 void msplat_enable_gpu_timing(bool enable);
 // Drains accumulated GPU times (ms per CB) into the provided vector. Thread-safe.
@@ -42,7 +49,8 @@ MTensor msplat_render(
     const std::tuple<int, int, int> tile_bounds, float clip_thresh,
     unsigned degree, unsigned degrees_to_use, float cam_pos[3],
     MTensor &features_dc, MTensor &features_rest,
-    MTensor &opacities, MTensor &background
+    MTensor &opacities, MTensor &background,
+    bool exact_overflow = false
 );
 
 // Fused forward + backward + Adam + grad_stats in one encoder

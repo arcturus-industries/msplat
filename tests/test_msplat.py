@@ -76,6 +76,64 @@ def _write_tiny_gaussian_ply(path):
         f.write(row)
 
 
+def _write_overflow_gaussian_ply(path, count=3000):
+    c0 = 0.28209479177387814
+    props = [
+        "x",
+        "y",
+        "z",
+        "nx",
+        "ny",
+        "nz",
+        "f_dc_0",
+        "f_dc_1",
+        "f_dc_2",
+        "opacity",
+        "scale_0",
+        "scale_1",
+        "scale_2",
+        "rot_0",
+        "rot_1",
+        "rot_2",
+        "rot_3",
+    ]
+    header = [
+        "ply",
+        "format binary_little_endian 1.0",
+        f"element vertex {count}",
+    ]
+    header += [f"property float {p}" for p in props]
+    header += ["end_header", ""]
+    rows = []
+    for i in range(count):
+        rows.append(
+            struct.pack(
+                "<17f",
+                0.0,
+                0.0,
+                -2.0 - i * 1e-6,
+                0.0,
+                0.0,
+                0.0,
+                (0.8 - 0.5) / c0,
+                (0.3 - 0.5) / c0,
+                (0.1 - 0.5) / c0,
+                -5.0,
+                np.log(0.01),
+                np.log(0.01),
+                np.log(0.01),
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+            )
+        )
+    with open(path, "wb") as f:
+        f.write("\n".join(header).encode("ascii"))
+        for row in rows:
+            f.write(row)
+
+
 def test_training_config_defaults():
     from msplat import TrainingConfig
 
@@ -218,6 +276,45 @@ def test_gaussian_renderer_from_ply():
         assert img.shape == (64, 64, 3)
         assert np.isfinite(img).all()
         assert img.max() > 0.0
+    finally:
+        os.unlink(path)
+
+
+@pytest.mark.skipif(platform.system() != "Darwin", reason="GaussianRenderer requires Metal")
+def test_gaussian_renderer_exact_overflow_mode_repairs_tiles():
+    """Exact overflow mode rerenders tiles that exceed the fast-path bin limit."""
+    from msplat import (
+        GaussianRenderer,
+        last_overflow_max_tile_count,
+        last_overflow_tile_count,
+        overflow_fallback_count,
+        reset_overflow_fallback_count,
+    )
+
+    with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as f:
+        path = f.name
+
+    try:
+        _write_overflow_gaussian_ply(path, count=3000)
+        reset_overflow_fallback_count()
+        renderer = GaussianRenderer(path, bg_color=[0.0, 0.0, 0.0], overflow_mode="exact")
+        pose = np.eye(4, dtype=np.float32)
+        img = renderer.render(
+            pose,
+            64,
+            64,
+            48.0,
+            48.0,
+            32.0,
+            32.0,
+            max_sh_degree=0,
+        )
+
+        assert img.shape == (64, 64, 3)
+        assert np.isfinite(img).all()
+        assert overflow_fallback_count() >= 1
+        assert last_overflow_tile_count() >= 1
+        assert last_overflow_max_tile_count() >= 3000
     finally:
         os.unlink(path)
 

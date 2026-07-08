@@ -584,6 +584,97 @@ kernel void nd_rasterize_forward_kernel(
     }
 }
 
+kernel void nd_rasterize_forward_overflow_tiles_kernel(
+    constant uint3& tile_bounds,
+    constant uint3& img_size,
+    constant uint& channels,
+    constant int* tile_bins, // int2
+    constant float* packed_xy_opac,
+    constant float* packed_conic,
+    constant float* packed_rgb,
+    device float* final_Ts,
+    device int* final_index,
+    device float* out_img,
+    constant float* background,
+    constant uint2& blockDim,
+    device atomic_uint* overflow_tile_flags,
+    uint2 blockIdx [[threadgroup_position_in_grid]],
+    uint2 threadIdx [[thread_position_in_threadgroup]],
+    uint tr [[thread_index_in_threadgroup]]
+) {
+    int32_t i = blockIdx.y * blockDim.y + threadIdx.y;
+    int32_t j = blockIdx.x * blockDim.x + threadIdx.x;
+    int32_t tile_id = ((int)i / BLOCK_Y) * tile_bounds.x + ((int)j / BLOCK_X);
+    if (atomic_load_explicit(&overflow_tile_flags[tile_id], memory_order_relaxed) == 0) {
+        return;
+    }
+
+    float px = (float)j;
+    float py = (float)i;
+    int32_t pix_id = i * (int)img_size.x + j;
+    const bool inside = (i < (int)img_size.y && j < (int)img_size.x);
+
+    int2 range = read_packed_int2(tile_bins, tile_id);
+    const int num_batches = (range.y - range.x + RAST_BLOCK_SIZE - 1) / RAST_BLOCK_SIZE;
+
+    threadgroup float3 xy_opacity_batch[RAST_BLOCK_SIZE];
+    threadgroup float3 conic_batch[RAST_BLOCK_SIZE];
+    threadgroup float3 rgbs_batch[RAST_BLOCK_SIZE];
+
+    float T = 1.f;
+    float3 pix_out = {0.f, 0.f, 0.f};
+    int last_contributor = range.x - 1;
+    bool done = false;
+
+    for (int b = 0; b < num_batches; ++b) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        int batch_start = range.x + RAST_BLOCK_SIZE * b;
+        int idx = batch_start + tr;
+        if (idx < range.y) {
+            xy_opacity_batch[tr] = read_packed_float3(packed_xy_opac, idx);
+            conic_batch[tr] = read_packed_float3(packed_conic, idx);
+            const float3 raw_c = read_packed_float3(packed_rgb, idx);
+            rgbs_batch[tr] = max(raw_c + 0.5f, 0.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (done || !inside) continue;
+
+        int batch_size = min(RAST_BLOCK_SIZE, range.y - batch_start);
+        for (int t = 0; t < batch_size; ++t) {
+            const float3 conic_local = conic_batch[t];
+            const float3 xy_opac = xy_opacity_batch[t];
+            const float2 delta = {xy_opac.x - px, xy_opac.y - py};
+            const float sigma = fma(0.5f,
+                fma(conic_local.x, delta.x * delta.x, conic_local.z * delta.y * delta.y),
+                conic_local.y * delta.x * delta.y);
+            if (sigma < 0.f || sigma >= 5.55f) continue;
+            const float alpha = min(0.999f, xy_opac.z * exp(-sigma));
+            if (alpha < 1.f / 255.f) continue;
+            const float next_T = T * (1.f - alpha);
+            if (next_T <= 1e-4f) {
+                last_contributor = batch_start + t - 1;
+                done = true;
+                break;
+            }
+            const float vis = alpha * T;
+            pix_out = fma(rgbs_batch[t], vis, pix_out);
+            T = next_T;
+            last_contributor = batch_start + t;
+        }
+    }
+
+    if (inside) {
+        final_Ts[pix_id] = T;
+        final_index[pix_id] = last_contributor;
+        float3 bg = {background[0], background[1], background[2]};
+        float3 final_rgb = saturate(fma(bg, T, pix_out));
+        out_img[CHANNELS * pix_id + 0] = final_rgb.x;
+        out_img[CHANNELS * pix_id + 1] = final_rgb.y;
+        out_img[CHANNELS * pix_id + 2] = final_rgb.z;
+    }
+}
+
 void sh_coeffs_to_color(
     const uint degree,
     const float3 viewdir,
@@ -2032,6 +2123,7 @@ kernel void scatter_to_prealloc_bins_kernel(
     device atomic_uint* scatter_counters    [[buffer(6)]],
     device uint64_t* prealloc_bins          [[buffer(7)]],
     device atomic_uint* overflow_flag       [[buffer(8)]],
+    device atomic_uint* overflow_tile_flags [[buffer(9)]],
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= num_points) return;
@@ -2051,6 +2143,7 @@ kernel void scatter_to_prealloc_bins_kernel(
                 // Clamp counter so prefix_sum sees at most MAX_TILE_ELEMS
                 atomic_store_explicit(&scatter_counters[tile_id], MAX_TILE_ELEMS, memory_order_relaxed);
                 atomic_store_explicit(overflow_flag, 1u, memory_order_relaxed);
+                atomic_store_explicit(&overflow_tile_flags[tile_id], 1u, memory_order_relaxed);
                 continue;
             }
             prealloc_bins[(uint64_t)tile_id * MAX_TILE_ELEMS + pos] = ((uint64_t)depth_bits << 32) | (uint64_t)idx;
@@ -2740,6 +2833,114 @@ kernel void rasterize_forward_chunked_kernel(
     }
 }
 
+kernel void rasterize_forward_chunked_overflow_tiles_kernel(
+    constant uint3& tile_bounds,
+    constant uint3& img_size,
+    constant uint& channels,
+    constant int* tile_bins,
+    constant float* packed_xy_opac,
+    constant float* packed_conic,
+    constant float* packed_rgb,
+    device float* chunk_T,
+    device float* chunk_C,
+    device int* chunk_final_idx,
+    constant uint& chunk_size,
+    constant uint& K_max,
+    constant uint2& blockDim,
+    device atomic_uint* overflow_tile_flags,
+    uint3 blockIdx [[threadgroup_position_in_grid]],
+    uint tr [[thread_index_in_threadgroup]]
+) {
+    uint k = blockIdx.z;
+    uint threadIdx_x = tr % RAST_BLOCK_X;
+    uint threadIdx_y = tr / RAST_BLOCK_X;
+    int32_t i = blockIdx.y * blockDim.y + threadIdx_y;
+    int32_t j = blockIdx.x * blockDim.x + threadIdx_x;
+    int32_t tile_id = ((int)i / BLOCK_Y) * tile_bounds.x + ((int)j / BLOCK_X);
+    if (atomic_load_explicit(&overflow_tile_flags[tile_id], memory_order_relaxed) == 0) {
+        return;
+    }
+
+    float px = (float)j;
+    float py = (float)i;
+    uint num_pixels = img_size.x * img_size.y;
+    int32_t pix_id = i * (int)img_size.x + j;
+    const bool inside = (i < (int)img_size.y && j < (int)img_size.x);
+
+    int2 full_range = read_packed_int2(tile_bins, tile_id);
+    int chunk_start = full_range.x + (int)(k * chunk_size);
+    int chunk_end = min(full_range.x + (int)((k + 1) * chunk_size), full_range.y);
+    uint out_offset = k * num_pixels + (uint)pix_id;
+
+    if (chunk_start >= chunk_end) {
+        if (inside) {
+            chunk_T[out_offset] = 1.f;
+            chunk_C[out_offset * 3 + 0] = 0.f;
+            chunk_C[out_offset * 3 + 1] = 0.f;
+            chunk_C[out_offset * 3 + 2] = 0.f;
+            chunk_final_idx[out_offset] = -1;
+        }
+        return;
+    }
+
+    int num_batches = (chunk_end - chunk_start + RAST_BLOCK_SIZE - 1) / RAST_BLOCK_SIZE;
+
+    threadgroup float3 xy_opacity_batch[RAST_BLOCK_SIZE];
+    threadgroup float3 conic_batch[RAST_BLOCK_SIZE];
+    threadgroup float3 rgbs_batch[RAST_BLOCK_SIZE];
+
+    float T = 1.f;
+    float3 pix_out = {0.f, 0.f, 0.f};
+    int last_contributor = chunk_start - 1;
+    bool done = false;
+
+    for (int b = 0; b < num_batches; ++b) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        int batch_start = chunk_start + RAST_BLOCK_SIZE * b;
+        int idx = batch_start + tr;
+        if (idx < chunk_end) {
+            xy_opacity_batch[tr] = read_packed_float3(packed_xy_opac, idx);
+            conic_batch[tr] = read_packed_float3(packed_conic, idx);
+            const float3 raw_c = read_packed_float3(packed_rgb, idx);
+            rgbs_batch[tr] = max(raw_c + 0.5f, 0.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (done || !inside) continue;
+
+        int batch_size = min(RAST_BLOCK_SIZE, chunk_end - batch_start);
+        for (int t = 0; t < batch_size; ++t) {
+            const float3 conic_local = conic_batch[t];
+            const float3 xy_opac = xy_opacity_batch[t];
+            const float2 delta = {xy_opac.x - px, xy_opac.y - py};
+            const float sigma = fma(0.5f,
+                fma(conic_local.x, delta.x * delta.x, conic_local.z * delta.y * delta.y),
+                conic_local.y * delta.x * delta.y);
+            if (sigma < 0.f || sigma >= 5.55f) continue;
+            const float alpha = min(0.999f, xy_opac.z * exp(-sigma));
+            if (alpha < 1.f / 255.f) continue;
+            const float next_T = T * (1.f - alpha);
+            if (next_T <= 1e-4f) {
+                last_contributor = batch_start + t - 1;
+                done = true;
+                break;
+            }
+            const float vis = alpha * T;
+            pix_out = fma(rgbs_batch[t], vis, pix_out);
+            T = next_T;
+            last_contributor = batch_start + t;
+        }
+    }
+
+    if (inside) {
+        chunk_T[out_offset] = T;
+        chunk_C[out_offset * 3 + 0] = pix_out.x;
+        chunk_C[out_offset * 3 + 1] = pix_out.y;
+        chunk_C[out_offset * 3 + 2] = pix_out.z;
+        chunk_final_idx[out_offset] = last_contributor;
+    }
+}
+
 // Forward merge: scan K chunks per pixel, produce final out_img/final_Ts/final_idx.
 // Also applies absolute transmittance cutoff: when T_running drops below 1e-4,
 // zeros out chunk_final_idx for remaining chunks so the backward skips them.
@@ -2785,6 +2986,63 @@ kernel void rasterize_forward_merge_kernel(
 
     // Zero out chunk_final_idx for chunks past the absolute cutoff
     // so the backward kernel skips them (bin_final < chunk_start → return)
+    for (uint k = cutoff_k; k < K_max; ++k) {
+        chunk_final_idx[k * num_pixels + pix_id] = -1;
+    }
+
+    final_Ts[pix_id] = T_running;
+    final_index[pix_id] = last_idx;
+    float3 bg = {background[0], background[1], background[2]};
+    float3 final_rgb = saturate(fma(bg, T_running, C_running));
+    out_img[CHANNELS * pix_id + 0] = final_rgb.x;
+    out_img[CHANNELS * pix_id + 1] = final_rgb.y;
+    out_img[CHANNELS * pix_id + 2] = final_rgb.z;
+}
+
+kernel void rasterize_forward_merge_overflow_tiles_kernel(
+    constant uint& num_pixels,
+    constant uint& K_max,
+    constant float* chunk_T,
+    constant float* chunk_C,
+    device int* chunk_final_idx,
+    device float* final_Ts,
+    device int* final_index,
+    device float* out_img,
+    constant float* background,
+    constant uint2& img_size,
+    constant uint3& tile_bounds,
+    device atomic_uint* overflow_tile_flags,
+    uint2 gp [[thread_position_in_grid]]
+) {
+    uint px = gp.x;
+    uint py = gp.y;
+    if (px >= img_size.x || py >= img_size.y) return;
+    uint tile_id = (py / BLOCK_Y) * tile_bounds.x + (px / BLOCK_X);
+    if (atomic_load_explicit(&overflow_tile_flags[tile_id], memory_order_relaxed) == 0) {
+        return;
+    }
+    uint pix_id = py * img_size.x + px;
+
+    float T_running = 1.f;
+    float3 C_running = {0.f, 0.f, 0.f};
+    int last_idx = -1;
+    uint cutoff_k = K_max;
+
+    for (uint k = 0; k < K_max; ++k) {
+        uint offset = k * num_pixels + pix_id;
+        int cfidx = chunk_final_idx[offset];
+        if (cfidx < 0 && k > 0) break;
+        float cT = chunk_T[offset];
+        float3 cC = {chunk_C[offset * 3 + 0], chunk_C[offset * 3 + 1], chunk_C[offset * 3 + 2]};
+        C_running = fma(cC, T_running, C_running);
+        T_running *= cT;
+        if (cfidx >= 0) last_idx = cfidx;
+        if (T_running <= 1e-4f) {
+            cutoff_k = k + 1;
+            break;
+        }
+    }
+
     for (uint k = cutoff_k; k < K_max; ++k) {
         chunk_final_idx[k * num_pixels + pix_id] = -1;
     }

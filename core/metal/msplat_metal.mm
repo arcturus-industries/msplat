@@ -6,12 +6,18 @@
 
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
+#import <algorithm>
+#import <cmath>
 #import <chrono>
+#import <cstdint>
+#import <cstring>
 #import <dlfcn.h>
-#import <unordered_map>
 #import <functional>
 #import <array>
+#import <limits>
 #import <mutex>
+#import <unordered_map>
+#import <vector>
 #import <mach/mach_time.h>
 
 // GPU profiling infrastructure.
@@ -131,6 +137,7 @@ struct MetalContext {
     // Forward pipeline kernels
     id<MTLComputePipelineState> project_and_sh_forward_kernel_cpso;
     id<MTLComputePipelineState> nd_rasterize_forward_kernel_cpso;
+    id<MTLComputePipelineState> nd_rasterize_forward_overflow_tiles_kernel_cpso;
     // Tile-local sorting
     id<MTLComputePipelineState> scatter_to_prealloc_bins_kernel_cpso;
     id<MTLComputePipelineState> bitonic_sort_per_tile_kernel_cpso;
@@ -141,6 +148,8 @@ struct MetalContext {
     // Depth-chunked rasterization
     id<MTLComputePipelineState> rasterize_forward_chunked_kernel_cpso;
     id<MTLComputePipelineState> rasterize_forward_merge_kernel_cpso;
+    id<MTLComputePipelineState> rasterize_forward_chunked_overflow_tiles_kernel_cpso;
+    id<MTLComputePipelineState> rasterize_forward_merge_overflow_tiles_kernel_cpso;
     id<MTLComputePipelineState> compute_chunk_prefix_suffix_kernel_cpso;
     id<MTLComputePipelineState> rasterize_backward_chunked_kernel_cpso;
     id<MTLComputePipelineState> rasterize_backward_kernel_cpso;
@@ -234,6 +243,7 @@ MetalContext* init_msplat_metal_context() {
     // Forward pipeline
     ctx->project_and_sh_forward_kernel_cpso       = load(@"project_and_sh_forward_kernel");
     ctx->nd_rasterize_forward_kernel_cpso         = load(@"nd_rasterize_forward_kernel");
+    ctx->nd_rasterize_forward_overflow_tiles_kernel_cpso = load(@"nd_rasterize_forward_overflow_tiles_kernel");
     // Tile-local sorting
     ctx->scatter_to_prealloc_bins_kernel_cpso      = load(@"scatter_to_prealloc_bins_kernel");
     ctx->bitonic_sort_per_tile_kernel_cpso        = load(@"bitonic_sort_per_tile_kernel");
@@ -244,6 +254,8 @@ MetalContext* init_msplat_metal_context() {
     // Depth-chunked rasterization
     ctx->rasterize_forward_chunked_kernel_cpso    = load(@"rasterize_forward_chunked_kernel");
     ctx->rasterize_forward_merge_kernel_cpso      = load(@"rasterize_forward_merge_kernel");
+    ctx->rasterize_forward_chunked_overflow_tiles_kernel_cpso = load(@"rasterize_forward_chunked_overflow_tiles_kernel");
+    ctx->rasterize_forward_merge_overflow_tiles_kernel_cpso = load(@"rasterize_forward_merge_overflow_tiles_kernel");
     ctx->compute_chunk_prefix_suffix_kernel_cpso  = load(@"compute_chunk_prefix_suffix_kernel");
     ctx->rasterize_backward_chunked_kernel_cpso   = load(@"rasterize_backward_chunked_kernel");
     ctx->rasterize_backward_kernel_cpso           = load(@"rasterize_backward_kernel");
@@ -287,6 +299,8 @@ MetalContext* get_global_context() {
     return ctx;
 }
 
+static void msplat_maybe_run_overflow_fallback_after_sync(MetalContext* ctx);
+
 
 
 #define ENC_SCALAR(encoder, x, i) [encoder setBytes:&x length:sizeof(x) atIndex:i]
@@ -314,7 +328,9 @@ void msplat_commit() {
 }
 
 void msplat_gpu_sync() {
-    get_global_context()->syncCB();
+    MetalContext* ctx = get_global_context();
+    ctx->syncCB();
+    msplat_maybe_run_overflow_fallback_after_sync(ctx);
 }
 
 void msplat_enable_gpu_timing(bool enable) {
@@ -367,6 +383,7 @@ struct FusedTensorCache {
 
     // Intersection overflow detection
     MTensor overflow_flag;
+    MTensor overflow_tile_flags;
     int64_t capacity_multiplier = 16;
 
     // Depth-chunked rasterization buffers
@@ -394,8 +411,8 @@ struct FusedTensorCache {
             aabb = mtensor_empty(dev, {np, 2}, DType::Float32);
             block_totals = mtensor_empty(dev, {(np + 1023) / 1024}, DType::Int32);
         }
-        if (cap != capacity) {
-            capacity = cap;
+        if (cap > capacity || !gaussian_ids.defined()) {
+            capacity = (int)cap;
             gaussian_ids = mtensor_empty(dev, {cap}, DType::Int32);
             packed_xy_opac = mtensor_empty(dev, {cap, 3}, DType::Float32);
             packed_conic = mtensor_empty(dev, {cap, 3}, DType::Float32);
@@ -427,12 +444,16 @@ struct FusedTensorCache {
             tile_offsets = mtensor_empty(dev, {nt}, DType::Int32);
             tile_scatter_counters = mtensor_empty(dev, {nt}, DType::Int32);
             prealloc_bins = mtensor_empty(dev, {(int64_t)nt * 2048}, DType::Int64);
+            overflow_tile_flags = mtensor_empty(dev, {nt}, DType::Int32);
         }
         if (!loss_sum.defined()) {
             loss_sum = mtensor_empty(dev, {1}, DType::Float32);
         }
         if (!overflow_flag.defined()) {
             overflow_flag = mtensor_empty(dev, {1}, DType::Int32);
+        }
+        if (!overflow_tile_flags.defined()) {
+            overflow_tile_flags = mtensor_empty(dev, {nt}, DType::Int32);
         }
     }
 
@@ -465,8 +486,323 @@ struct FusedTensorCache {
 };
 static FusedTensorCache g_tcache;
 
+struct PendingRenderFallback {
+    bool active = false;
+    unsigned img_height = 0, img_width = 0;
+    uint32_t tile_bounds_x = 0, tile_bounds_y = 0, tile_bounds_z = 1;
+    MTensor* opacities = nullptr;
+    MTensor* background = nullptr;
+};
+
+static PendingRenderFallback g_pending_render_fallback;
+static uint64_t g_overflow_fallback_count = 0;
+static uint64_t g_overflow_tile_event_count = 0;
+static uint32_t g_last_overflow_tile_count = 0;
+static uint32_t g_last_overflow_max_tile_count = 0;
+
+uint64_t msplat_overflow_fallback_count() {
+    return g_overflow_fallback_count;
+}
+
+uint64_t msplat_overflow_tile_event_count() {
+    return g_overflow_tile_event_count;
+}
+
+uint32_t msplat_last_overflow_tile_count() {
+    return g_last_overflow_tile_count;
+}
+
+uint32_t msplat_last_overflow_max_tile_count() {
+    return g_last_overflow_max_tile_count;
+}
+
+void msplat_reset_overflow_fallback_count() {
+    g_overflow_fallback_count = 0;
+    g_overflow_tile_event_count = 0;
+    g_last_overflow_tile_count = 0;
+    g_last_overflow_max_tile_count = 0;
+}
+
 void cleanup_msplat_metal() {
     g_tcache = FusedTensorCache{};
+    g_pending_render_fallback = PendingRenderFallback{};
+    msplat_reset_overflow_fallback_count();
+}
+
+static inline void cpu_get_tile_bbox(
+    float cx, float cy, float rx, float ry,
+    int tile_bounds_x, int tile_bounds_y,
+    uint32_t& min_x, uint32_t& min_y, uint32_t& max_x, uint32_t& max_y
+) {
+    float tile_cx = cx / (float)BLOCK_X;
+    float tile_cy = cy / (float)BLOCK_Y;
+    float tile_rx = rx / (float)BLOCK_X;
+    float tile_ry = ry / (float)BLOCK_Y;
+    min_x = (uint32_t)std::min(std::max(0, (int)(tile_cx - tile_rx)), tile_bounds_x);
+    max_x = (uint32_t)std::min(std::max(0, (int)(tile_cx + tile_rx + 1.0f)), tile_bounds_x);
+    min_y = (uint32_t)std::min(std::max(0, (int)(tile_cy - tile_ry)), tile_bounds_y);
+    max_y = (uint32_t)std::min(std::max(0, (int)(tile_cy + tile_ry + 1.0f)), tile_bounds_y);
+}
+
+struct CpuTileIntersection {
+    uint64_t key;
+    int32_t gaussian_id;
+};
+
+static uint32_t count_overflow_tiles() {
+    if (!g_tcache.overflow_tile_flags.defined() || g_tcache.num_tiles <= 0) {
+        return 0;
+    }
+    const int32_t* flags = g_tcache.overflow_tile_flags.data<int32_t>();
+    uint32_t count = 0;
+    for (int i = 0; i < g_tcache.num_tiles; ++i) {
+        count += flags[i] != 0;
+    }
+    return count;
+}
+
+static uint32_t build_exact_overflow_bins_cpu(
+    MetalContext* ctx,
+    const PendingRenderFallback& pending
+) {
+    const int num_points = g_tcache.fwd_num_points;
+    const int num_tiles = (int)(pending.tile_bounds_x * pending.tile_bounds_y);
+    if (num_points <= 0 || num_tiles <= 0 || !pending.opacities || !pending.background ||
+        !g_tcache.overflow_tile_flags.defined()) {
+        return 0;
+    }
+
+    const int32_t* overflow_flags = g_tcache.overflow_tile_flags.data<int32_t>();
+    const float* xys = g_tcache.xys.data<float>();
+    const float* depths = g_tcache.depths.data<float>();
+    const int32_t* radii = g_tcache.radii_out.data<int32_t>();
+    const float* aabb = g_tcache.aabb.data<float>();
+
+    int64_t total_intersections = 0;
+    int max_tile_count = 0;
+    std::vector<int32_t> tile_counts(num_tiles, 0);
+    for (int idx = 0; idx < num_points; ++idx) {
+        if (radii[idx] <= 0) continue;
+        uint32_t min_x, min_y, max_x, max_y;
+        cpu_get_tile_bbox(
+            xys[2 * idx + 0], xys[2 * idx + 1],
+            aabb[2 * idx + 0], aabb[2 * idx + 1],
+            (int)pending.tile_bounds_x, (int)pending.tile_bounds_y,
+            min_x, min_y, max_x, max_y);
+        for (uint32_t y = min_y; y < max_y; ++y) {
+            for (uint32_t x = min_x; x < max_x; ++x) {
+                int tile_id = (int)(y * pending.tile_bounds_x + x);
+                if (overflow_flags[tile_id] == 0) continue;
+                int count = ++tile_counts[tile_id];
+                max_tile_count = std::max(max_tile_count, count);
+                ++total_intersections;
+            }
+        }
+    }
+
+    if (total_intersections <= 0) {
+        return 0;
+    }
+    if (total_intersections > std::numeric_limits<int32_t>::max()) {
+        fprintf(stderr, "msplat: exact overflow fallback skipped; too many intersections (%lld).\n",
+                (long long)total_intersections);
+        return 0;
+    }
+
+    g_tcache.ensure_forward(
+        num_points, total_intersections,
+        pending.img_height, pending.img_width, num_tiles, false, ctx->device);
+
+    std::vector<CpuTileIntersection> intersections;
+    intersections.reserve((size_t)total_intersections);
+    for (int idx = 0; idx < num_points; ++idx) {
+        if (radii[idx] <= 0) continue;
+        uint32_t min_x, min_y, max_x, max_y;
+        cpu_get_tile_bbox(
+            xys[2 * idx + 0], xys[2 * idx + 1],
+            aabb[2 * idx + 0], aabb[2 * idx + 1],
+            (int)pending.tile_bounds_x, (int)pending.tile_bounds_y,
+            min_x, min_y, max_x, max_y);
+
+        uint32_t depth_bits;
+        std::memcpy(&depth_bits, &depths[idx], sizeof(depth_bits));
+        for (uint32_t y = min_y; y < max_y; ++y) {
+            for (uint32_t x = min_x; x < max_x; ++x) {
+                uint64_t tile_id = (uint64_t)(y * pending.tile_bounds_x + x);
+                if (overflow_flags[tile_id] == 0) continue;
+                intersections.push_back({(tile_id << 32) | (uint64_t)depth_bits, idx});
+            }
+        }
+    }
+
+    std::sort(intersections.begin(), intersections.end(),
+              [](const CpuTileIntersection& a, const CpuTileIntersection& b) {
+                  if (a.key != b.key) return a.key < b.key;
+                  return a.gaussian_id < b.gaussian_id;
+              });
+
+    int* tile_bins = g_tcache.tile_bins.data<int>();
+    int32_t* gaussian_ids = g_tcache.gaussian_ids.data<int32_t>();
+    float* packed_xy_opac = g_tcache.packed_xy_opac.data<float>();
+    float* packed_conic = g_tcache.packed_conic.data<float>();
+    float* packed_rgb = g_tcache.packed_rgb.data<float>();
+    const float* conics = g_tcache.conics.data<float>();
+    const float* colors = g_tcache.colors.data<float>();
+    const float* opacities = pending.opacities->data<float>();
+
+    std::fill(tile_bins, tile_bins + num_tiles * 2, 0);
+    int prev_tile = -1;
+    for (int i = 0; i < (int)intersections.size(); ++i) {
+        int tile_id = (int)(intersections[i].key >> 32);
+        if (tile_id != prev_tile) {
+            if (prev_tile >= 0) tile_bins[2 * prev_tile + 1] = i;
+            tile_bins[2 * tile_id + 0] = i;
+            prev_tile = tile_id;
+        }
+
+        int32_t g = intersections[i].gaussian_id;
+        gaussian_ids[i] = g;
+        packed_xy_opac[3 * i + 0] = xys[2 * g + 0];
+        packed_xy_opac[3 * i + 1] = xys[2 * g + 1];
+        packed_xy_opac[3 * i + 2] = 1.0f / (1.0f + std::exp(-opacities[g]));
+        packed_conic[3 * i + 0] = conics[3 * g + 0];
+        packed_conic[3 * i + 1] = conics[3 * g + 1];
+        packed_conic[3 * i + 2] = conics[3 * g + 2];
+        packed_rgb[3 * i + 0] = colors[3 * g + 0];
+        packed_rgb[3 * i + 1] = colors[3 * g + 1];
+        packed_rgb[3 * i + 2] = colors[3 * g + 2];
+    }
+    if (prev_tile >= 0) tile_bins[2 * prev_tile + 1] = (int)intersections.size();
+
+    return (uint32_t)std::max(1, max_tile_count);
+}
+
+static void encode_exact_overflow_raster(
+    MetalContext* ctx,
+    const PendingRenderFallback& pending,
+    uint32_t max_tile_count
+) {
+    const uint32_t channels = 3;
+    constexpr uint32_t CHUNK_SIZE = 512;
+    uint32_t K_max = (max_tile_count + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    if (K_max > 1) {
+        g_tcache.ensure_chunks((int)K_max, pending.img_height, pending.img_width, ctx->device);
+    }
+
+    auto tile_bounds_arr = std::make_shared<std::array<uint32_t, 4>>(std::array<uint32_t, 4>{
+        pending.tile_bounds_x, pending.tile_bounds_y, pending.tile_bounds_z, 0xDEAD
+    });
+    auto img_size_dim3 = std::make_shared<std::array<uint32_t, 4>>(std::array<uint32_t, 4>{
+        pending.img_width, pending.img_height, 1, 0xDEAD
+    });
+    auto block_size_dim2 = std::make_shared<std::array<int32_t, 2>>(std::array<int32_t, 2>{
+        RAST_BLOCK_X, RAST_BLOCK_Y
+    });
+
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    assert(command_buffer && "Failed to retrieve command buffer reference");
+
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        assert(enc && "Failed to create compute command encoder");
+
+        if (K_max <= 1) {
+            MTLSize num_tg = MTLSizeMake(
+                (pending.img_width + RAST_BLOCK_X - 1) / RAST_BLOCK_X,
+                (pending.img_height + RAST_BLOCK_Y - 1) / RAST_BLOCK_Y, 1);
+            [enc setComputePipelineState:ctx->nd_rasterize_forward_overflow_tiles_kernel_cpso];
+            [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:0];
+            [enc setBytes:img_size_dim3->data() length:sizeof(*img_size_dim3) atIndex:1];
+            ENC_SCALAR(enc, channels, 2); ENC_BUF(enc, g_tcache.tile_bins, 3);
+            ENC_BUF(enc, g_tcache.packed_xy_opac, 4); ENC_BUF(enc, g_tcache.packed_conic, 5);
+            ENC_BUF(enc, g_tcache.packed_rgb, 6);
+            ENC_BUF(enc, g_tcache.final_Ts, 7); ENC_BUF(enc, g_tcache.final_idx, 8);
+            ENC_BUF(enc, g_tcache.out_img, 9);
+            [enc setBuffer:pending.background->buffer() offset:0 atIndex:10];
+            [enc setBytes:block_size_dim2->data() length:sizeof(*block_size_dim2) atIndex:11];
+            ENC_BUF(enc, g_tcache.overflow_tile_flags, 12);
+            [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
+        } else {
+            uint32_t tile_x = (pending.img_width + RAST_BLOCK_X - 1) / RAST_BLOCK_X;
+            uint32_t tile_y = (pending.img_height + RAST_BLOCK_Y - 1) / RAST_BLOCK_Y;
+            uint32_t num_pix = pending.img_width * pending.img_height;
+            auto img_sz_2 = std::make_shared<std::array<uint32_t, 2>>(std::array<uint32_t, 2>{
+                pending.img_width, pending.img_height
+            });
+
+            [enc setComputePipelineState:ctx->rasterize_forward_chunked_overflow_tiles_kernel_cpso];
+            [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:0];
+            [enc setBytes:img_size_dim3->data() length:sizeof(*img_size_dim3) atIndex:1];
+            ENC_SCALAR(enc, channels, 2); ENC_BUF(enc, g_tcache.tile_bins, 3);
+            ENC_BUF(enc, g_tcache.packed_xy_opac, 4); ENC_BUF(enc, g_tcache.packed_conic, 5);
+            ENC_BUF(enc, g_tcache.packed_rgb, 6);
+            ENC_BUF(enc, g_tcache.chunk_T, 7); ENC_BUF(enc, g_tcache.chunk_C, 8);
+            ENC_BUF(enc, g_tcache.chunk_final_idx, 9);
+            ENC_SCALAR(enc, CHUNK_SIZE, 10); ENC_SCALAR(enc, K_max, 11);
+            [enc setBytes:block_size_dim2->data() length:sizeof(*block_size_dim2) atIndex:12];
+            ENC_BUF(enc, g_tcache.overflow_tile_flags, 13);
+            [enc dispatchThreadgroups:MTLSizeMake(tile_x, tile_y, K_max)
+                 threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
+
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [enc setComputePipelineState:ctx->rasterize_forward_merge_overflow_tiles_kernel_cpso];
+            ENC_SCALAR(enc, num_pix, 0); ENC_SCALAR(enc, K_max, 1);
+            ENC_BUF(enc, g_tcache.chunk_T, 2); ENC_BUF(enc, g_tcache.chunk_C, 3);
+            ENC_BUF(enc, g_tcache.chunk_final_idx, 4);
+            ENC_BUF(enc, g_tcache.final_Ts, 5); ENC_BUF(enc, g_tcache.final_idx, 6);
+            ENC_BUF(enc, g_tcache.out_img, 7);
+            [enc setBuffer:pending.background->buffer() offset:0 atIndex:8];
+            [enc setBytes:img_sz_2->data() length:sizeof(*img_sz_2) atIndex:9];
+            [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:10];
+            ENC_BUF(enc, g_tcache.overflow_tile_flags, 11);
+            [enc dispatchThreads:MTLSizeMake(pending.img_width, pending.img_height, 1)
+                 threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        }
+
+        [enc endEncoding];
+    });
+}
+
+static void msplat_maybe_run_overflow_fallback_after_sync(MetalContext* ctx) {
+    if (!g_pending_render_fallback.active || !g_tcache.overflow_flag.defined()) {
+        return;
+    }
+
+    PendingRenderFallback pending = g_pending_render_fallback;
+    g_pending_render_fallback.active = false;
+
+    int32_t flag_val = *g_tcache.overflow_flag.data<int32_t>();
+    if (flag_val <= 0) {
+        g_last_overflow_tile_count = 0;
+        g_last_overflow_max_tile_count = 0;
+        return;
+    }
+
+    uint32_t overflow_tile_count = count_overflow_tiles();
+    g_last_overflow_tile_count = overflow_tile_count;
+    g_last_overflow_max_tile_count = 0;
+    g_overflow_tile_event_count += overflow_tile_count;
+    if (overflow_tile_count == 0) {
+        return;
+    }
+
+    static bool info_printed = false;
+    if (!info_printed) {
+        fprintf(stderr, "msplat: per-tile overflow detected; exact-rerendering overflow tiles.\n");
+        info_printed = true;
+    }
+
+    uint32_t max_tile_count = build_exact_overflow_bins_cpu(ctx, pending);
+    if (max_tile_count == 0) {
+        fprintf(stderr, "msplat: exact overflow fallback failed; keeping fast-path render.\n");
+        return;
+    }
+    g_last_overflow_max_tile_count = max_tile_count;
+
+    encode_exact_overflow_raster(ctx, pending, max_tile_count);
+    ctx->syncCB();
+    *g_tcache.overflow_flag.data<int32_t>() = 0;
+    ++g_overflow_fallback_count;
 }
 
 // Internal forward pipeline — used by both msplat_render and msplat_train_step.
@@ -597,6 +933,7 @@ static void forward_pipeline(
             ENC_BUF(enc, g_tcache.tile_scatter_counters, 6);
             ENC_BUF(enc, g_tcache.prealloc_bins, 7);
             ENC_BUF(enc, g_tcache.overflow_flag, 8);
+            ENC_BUF(enc, g_tcache.overflow_tile_flags, 9);
             [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         }
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -738,6 +1075,7 @@ static void forward_pipeline(
             // tile_bins written by sort kernel, tile_counts no longer used
             [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
             [blit fillBuffer:g_tcache.overflow_flag.buffer() range:NSMakeRange(0, g_tcache.overflow_flag.nbytes()) value:0];
+            [blit fillBuffer:g_tcache.overflow_tile_flags.buffer() range:NSMakeRange(0, g_tcache.overflow_tile_flags.nbytes()) value:0];
             [blit fillBuffer:g_tcache.tile_scatter_counters.buffer() range:NSMakeRange(0, g_tcache.tile_scatter_counters.nbytes()) value:0];
             [blit endEncoding];
 
@@ -769,7 +1107,8 @@ MTensor msplat_render(
     const std::tuple<int, int, int> tile_bounds, float clip_thresh,
     unsigned degree, unsigned degrees_to_use, float cam_pos[3],
     MTensor &features_dc, MTensor &features_rest,
-    MTensor &opacities, MTensor &background
+    MTensor &opacities, MTensor &background,
+    bool exact_overflow
 ) {
     MTensor dummyGt, dummyWindow;
     forward_pipeline(num_points, means3d, scales, glob_scale,
@@ -777,6 +1116,18 @@ MTensor msplat_render(
         img_height, img_width, tile_bounds, clip_thresh,
         degree, degrees_to_use, cam_pos, features_dc, features_rest,
         opacities, background, dummyGt, dummyWindow, 0.0f, false);
+    if (exact_overflow) {
+        g_pending_render_fallback.active = true;
+        g_pending_render_fallback.img_height = img_height;
+        g_pending_render_fallback.img_width = img_width;
+        g_pending_render_fallback.tile_bounds_x = (uint32_t)std::get<0>(tile_bounds);
+        g_pending_render_fallback.tile_bounds_y = (uint32_t)std::get<1>(tile_bounds);
+        g_pending_render_fallback.tile_bounds_z = (uint32_t)std::get<2>(tile_bounds);
+        g_pending_render_fallback.opacities = &opacities;
+        g_pending_render_fallback.background = &background;
+    } else {
+        g_pending_render_fallback.active = false;
+    }
     return g_tcache.out_img;
 }
 
@@ -940,6 +1291,7 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_BUF(enc, g_tcache.tile_scatter_counters, 6);
             ENC_BUF(enc, g_tcache.prealloc_bins, 7);
             ENC_BUF(enc, g_tcache.overflow_flag, 8);
+            ENC_BUF(enc, g_tcache.overflow_tile_flags, 9);
             [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         }
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -1172,6 +1524,7 @@ std::tuple<MTensor, float> msplat_train_step(
         // tile_bins written by sort kernel, tile_counts no longer used
         [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
         [blit fillBuffer:g_tcache.overflow_flag.buffer() range:NSMakeRange(0, g_tcache.overflow_flag.nbytes()) value:0];
+        [blit fillBuffer:g_tcache.overflow_tile_flags.buffer() range:NSMakeRange(0, g_tcache.overflow_tile_flags.nbytes()) value:0];
         [blit fillBuffer:g_tcache.tile_scatter_counters.buffer() range:NSMakeRange(0, g_tcache.tile_scatter_counters.nbytes()) value:0];
         [blit fillBuffer:v_xy.buffer() range:NSMakeRange(0, v_xy.nbytes()) value:0];
         [blit fillBuffer:v_conic.buffer() range:NSMakeRange(0, v_conic.nbytes()) value:0];

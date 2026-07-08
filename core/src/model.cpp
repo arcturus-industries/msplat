@@ -548,14 +548,14 @@ Model::CamSetup Model::prepareCam(Camera& cam, int step) {
     return s;
 }
 
-MTensor Model::render(Camera& cam, int step){
+MTensor Model::render(Camera& cam, int step, bool exactOverflow){
     auto s = prepareCam(cam, step);
     return msplat_render(
         means.size(0), means, scales, 1.0f,
         quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
         s.height, s.width, s.tileBounds, 0.01f,
         s.degree, s.degreesToUse, s.cam_pos, featuresDc, featuresRest,
-        opacities, backgroundColor);
+        opacities, backgroundColor, exactOverflow);
 }
 
 void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){

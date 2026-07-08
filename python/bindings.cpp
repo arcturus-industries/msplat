@@ -287,9 +287,10 @@ class GaussianRenderer {
 public:
     std::unique_ptr<Model> model;
     std::vector<float> background;
+    bool exact_overflow = false;
 
-    GaussianRenderer(const std::string &ply_path, std::vector<float> bg_color)
-        : background(validate_bg_color(bg_color))
+    GaussianRenderer(const std::string &ply_path, std::vector<float> bg_color, const std::string &overflow_mode)
+        : background(validate_bg_color(bg_color)), exact_overflow(validate_overflow_mode(overflow_mode))
     {
         InputData input;
         input.scale = 1.0f;
@@ -323,6 +324,12 @@ public:
         if (bg_color.size() != 3)
             throw std::invalid_argument("bg_color must have exactly 3 elements [R, G, B]");
         return bg_color;
+    }
+
+    static bool validate_overflow_mode(const std::string &overflow_mode) {
+        if (overflow_mode == "fast") return false;
+        if (overflow_mode == "exact") return true;
+        throw std::invalid_argument("overflow_mode must be 'fast' or 'exact'");
     }
 
     void set_background(const std::vector<float> &bg_color) {
@@ -360,7 +367,7 @@ public:
         memcpy(cam.camToWorld, cam_to_world.data(), 16 * sizeof(float));
 
         int degree_step = std::clamp(max_sh_degree, 0, model->shDegree);
-        MTensor rgb = model->render(cam, degree_step);
+        MTensor rgb = model->render(cam, degree_step, exact_overflow);
         msplat_gpu_sync();
         MTensor rgb_cpu = rgb.cpu();
 
@@ -514,8 +521,9 @@ NB_MODULE(_core, m) {
 
     nb::class_<GaussianRenderer>(m, "GaussianRenderer",
             "Render-only 3D Gaussian Splatting PLY renderer. All computation runs on the Metal GPU.")
-        .def(nb::init<const std::string &, std::vector<float>>(),
-            "ply_path"_a, "bg_color"_a = std::vector<float>{0.0f, 0.0f, 0.0f})
+        .def(nb::init<const std::string &, std::vector<float>, const std::string &>(),
+            "ply_path"_a, "bg_color"_a = std::vector<float>{0.0f, 0.0f, 0.0f},
+            "overflow_mode"_a = "fast")
         .def("render", &GaussianRenderer::render,
             "cam_to_world"_a, "width"_a, "height"_a,
             "fx"_a, "fy"_a, "cx"_a, "cy"_a,
@@ -527,5 +535,15 @@ NB_MODULE(_core, m) {
 
     // Utility
     m.def("sync", &msplat_gpu_sync, "Synchronize GPU (wait for all commands to complete)");
+    m.def("overflow_fallback_count", &msplat_overflow_fallback_count,
+          "Number of render-only overflow fallback rerenders completed.");
+    m.def("overflow_tile_event_count", &msplat_overflow_tile_event_count,
+          "Cumulative number of overfull tile events observed by render-only overflow detection.");
+    m.def("last_overflow_tile_count", &msplat_last_overflow_tile_count,
+          "Number of tiles repaired by the most recent exact overflow fallback.");
+    m.def("last_overflow_max_tile_count", &msplat_last_overflow_max_tile_count,
+          "Largest exact per-tile intersection count from the most recent fallback.");
+    m.def("reset_overflow_fallback_count", &msplat_reset_overflow_fallback_count,
+          "Reset the render-only overflow fallback debug counters.");
     m.def("cleanup", &cleanup_msplat_metal, "Release all cached GPU resources");
 }

@@ -39,7 +39,7 @@ struct Model{
   };
   CamSetup prepareCam(Camera& cam, int step);
   void fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight);
-  MTensor render(Camera& cam, int step);
+  MTensor render(Camera& cam, int step, bool exactOverflow = false);
 
   MTensor means;
   MTensor scales;

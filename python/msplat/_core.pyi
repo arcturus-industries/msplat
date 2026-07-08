@@ -165,6 +165,7 @@ class GaussianRenderer:
         self,
         ply_path: str,
         bg_color: list[float] = ...,
+        overflow_mode: str = ...,
     ) -> None: ...
 
     def render(
@@ -189,6 +190,26 @@ class GaussianRenderer:
     def splat_count(self) -> int:
         """Number of loaded Gaussians."""
         ...
+
+def overflow_fallback_count() -> int:
+    """Number of render-only overflow fallback rerenders completed."""
+    ...
+
+def overflow_tile_event_count() -> int:
+    """Cumulative number of overfull tile events observed by render-only overflow detection."""
+    ...
+
+def last_overflow_tile_count() -> int:
+    """Number of tiles repaired by the most recent exact overflow fallback."""
+    ...
+
+def last_overflow_max_tile_count() -> int:
+    """Largest exact per-tile intersection count from the most recent fallback."""
+    ...
+
+def reset_overflow_fallback_count() -> None:
+    """Reset the render-only overflow fallback debug counters."""
+    ...
 
 def sync() -> None:
     """Synchronize GPU (wait for all commands to complete)."""

@@ -50,7 +50,8 @@ MTensor msplat_render(
     unsigned degree, unsigned degrees_to_use, float cam_pos[3],
     MTensor &features_dc, MTensor &features_rest,
     MTensor &opacities, MTensor &background,
-    bool exact_overflow = false
+    bool exact_overflow = false,
+    bool radix_overflow = false
 );
 
 std::tuple<MTensor, MTensor> msplat_render_depth(
@@ -62,7 +63,8 @@ std::tuple<MTensor, MTensor> msplat_render_depth(
     unsigned degree, unsigned degrees_to_use, float cam_pos[3],
     MTensor &features_dc, MTensor &features_rest,
     MTensor &opacities, MTensor &background,
-    bool exact_overflow = false
+    bool exact_overflow = false,
+    bool radix_overflow = false
 );
 
 // Fused forward + backward + Adam + grad_stats in one encoder

@@ -143,6 +143,12 @@ struct MetalContext {
     // Tile-local sorting
     id<MTLComputePipelineState> scatter_to_prealloc_bins_kernel_cpso;
     id<MTLComputePipelineState> bitonic_sort_per_tile_kernel_cpso;
+    id<MTLComputePipelineState> map_gaussian_to_intersects_kernel_cpso;
+    id<MTLComputePipelineState> get_tile_bin_edges_kernel_cpso;
+    id<MTLComputePipelineState> pack_sorted_gaussians_kernel_cpso;
+    id<MTLComputePipelineState> radix_sort_histogram_kernel_cpso;
+    id<MTLComputePipelineState> radix_sort_scan_kernel_cpso;
+    id<MTLComputePipelineState> radix_sort_scatter_kernel_cpso;
     // Prefix sum
     id<MTLComputePipelineState> prefix_sum_kernel_cpso;
     id<MTLComputePipelineState> block_reduce_kernel_cpso;
@@ -251,6 +257,12 @@ MetalContext* init_msplat_metal_context() {
     // Tile-local sorting
     ctx->scatter_to_prealloc_bins_kernel_cpso      = load(@"scatter_to_prealloc_bins_kernel");
     ctx->bitonic_sort_per_tile_kernel_cpso        = load(@"bitonic_sort_per_tile_kernel");
+    ctx->map_gaussian_to_intersects_kernel_cpso    = load(@"map_gaussian_to_intersects_kernel");
+    ctx->get_tile_bin_edges_kernel_cpso            = load(@"get_tile_bin_edges_kernel");
+    ctx->pack_sorted_gaussians_kernel_cpso         = load(@"pack_sorted_gaussians_kernel");
+    ctx->radix_sort_histogram_kernel_cpso          = load(@"radix_sort_histogram_kernel");
+    ctx->radix_sort_scan_kernel_cpso               = load(@"radix_sort_scan_kernel");
+    ctx->radix_sort_scatter_kernel_cpso            = load(@"radix_sort_scatter_kernel");
     // Prefix sum
     ctx->prefix_sum_kernel_cpso                   = load(@"prefix_sum_kernel");
     ctx->block_reduce_kernel_cpso                 = load(@"block_reduce_kernel");
@@ -403,7 +415,9 @@ struct FusedTensorCache {
     // forward packed buffers so fallback rerenders cannot poison later renders.
     int64_t exact_capacity = 0;
     int exact_num_tiles = 0;
+    int64_t exact_radix_blocks = 0;
     bool exact_has_rgb = false;
+    MTensor exact_isect_ids, exact_isect_ids_tmp, exact_gaussian_ids_tmp, exact_radix_counts;
     MTensor exact_gaussian_ids;
     MTensor exact_packed_xy_opac, exact_packed_conic, exact_packed_rgb;
     MTensor exact_tile_bins;
@@ -504,6 +518,19 @@ struct FusedTensorCache {
         }
     }
 
+    void ensure_radix_overflow(int64_t cap, id<MTLDevice> dev) {
+        if (!exact_isect_ids.defined() || exact_isect_ids.size(0) < cap) {
+            exact_isect_ids = mtensor_empty(dev, {cap}, DType::Int64);
+            exact_isect_ids_tmp = mtensor_empty(dev, {cap}, DType::Int64);
+            exact_gaussian_ids_tmp = mtensor_empty(dev, {cap}, DType::Int32);
+        }
+        int64_t radix_blocks = (cap + 255) / 256;
+        if (radix_blocks > exact_radix_blocks || !exact_radix_counts.defined()) {
+            exact_radix_blocks = radix_blocks;
+            exact_radix_counts = mtensor_empty(dev, {exact_radix_blocks * 256}, DType::Int32);
+        }
+    }
+
     void ensure_depth_outputs(int ih, int iw, id<MTLDevice> dev) {
         if (!out_depth.defined() || out_depth.size(0) != ih || out_depth.size(1) != iw) {
             out_depth = mtensor_empty(dev, {ih, iw}, DType::Float32);
@@ -532,6 +559,7 @@ static FusedTensorCache g_tcache;
 
 struct PendingRenderFallback {
     bool active = false;
+    bool use_gpu_radix = false;
     unsigned img_height = 0, img_width = 0;
     uint32_t tile_bounds_x = 0, tile_bounds_y = 0, tile_bounds_z = 1;
     MTensor* opacities = nullptr;
@@ -823,6 +851,161 @@ static void encode_exact_overflow_raster(
     });
 }
 
+static void encode_prefix_sum_int32(
+    MetalContext* ctx,
+    id<MTLComputeCommandEncoder> enc,
+    uint32_t N,
+    MTensor& input,
+    MTensor& output,
+    MTensor& block_totals
+) {
+    if (N <= 1024) {
+        [enc setComputePipelineState:ctx->prefix_sum_kernel_cpso];
+        ENC_SCALAR(enc, N, 0); ENC_BUF(enc, input, 1); ENC_BUF(enc, output, 2);
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+        return;
+    }
+
+    uint32_t K = (N + 1023) / 1024;
+    [enc setComputePipelineState:ctx->block_reduce_kernel_cpso];
+    ENC_SCALAR(enc, N, 0); ENC_BUF(enc, input, 1); ENC_BUF(enc, block_totals, 2);
+    [enc dispatchThreadgroups:MTLSizeMake(K, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [enc setComputePipelineState:ctx->block_scan_propagate_kernel_cpso];
+    ENC_SCALAR(enc, N, 0); ENC_BUF(enc, input, 1); ENC_BUF(enc, output, 2); ENC_BUF(enc, block_totals, 3);
+    [enc dispatchThreadgroups:MTLSizeMake(K, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+}
+
+static uint32_t run_gpu_radix_overflow_fallback(
+    MetalContext* ctx,
+    const PendingRenderFallback& pending
+) {
+    int num_points = g_tcache.fwd_num_points;
+    int num_tiles = (int)(pending.tile_bounds_x * pending.tile_bounds_y);
+    if (num_points <= 0 || num_tiles <= 0) return 0;
+
+    uint32_t num_points_u32 = (uint32_t)num_points;
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    assert(command_buffer && "Failed to retrieve command buffer reference");
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        assert(enc && "Failed to create compute command encoder");
+        // ponytail: in-place prefix is enough here; projection rewrites num_tiles_hit on the next render.
+        encode_prefix_sum_int32(ctx, enc, num_points_u32, g_tcache.num_tiles_hit, g_tcache.num_tiles_hit, g_tcache.block_totals);
+        [enc endEncoding];
+    });
+    ctx->syncCB();
+
+    int64_t total_intersections = (int64_t)g_tcache.num_tiles_hit.data<int32_t>()[num_points - 1];
+    if (total_intersections <= 0 || total_intersections > std::numeric_limits<uint32_t>::max()) {
+        fprintf(stderr, "msplat: gpu radix overflow fallback skipped; unsupported intersection count (%lld).\n",
+                (long long)total_intersections);
+        return 0;
+    }
+
+    // ponytail: reuse the existing exact fallback packed buffers; the sorter gets only key/value scratch.
+    g_tcache.ensure_exact_overflow(total_intersections, num_tiles, true, ctx->device);
+    g_tcache.ensure_radix_overflow(total_intersections, ctx->device);
+
+    uint32_t capacity_u32 = (uint32_t)total_intersections;
+    uint32_t num_blocks = (capacity_u32 + 255) / 256;
+    uint32_t channels = 3;
+    auto tile_bounds_arr = std::make_shared<std::array<uint32_t, 4>>(std::array<uint32_t, 4>{
+        pending.tile_bounds_x, pending.tile_bounds_y, pending.tile_bounds_z, 0xDEAD
+    });
+
+    command_buffer = ctx->getCommandBuffer();
+    assert(command_buffer && "Failed to retrieve command buffer reference");
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+        [blit fillBuffer:g_tcache.overflow_flag.buffer() range:NSMakeRange(0, g_tcache.overflow_flag.nbytes()) value:0];
+        [blit fillBuffer:g_tcache.exact_tile_bins.buffer() range:NSMakeRange(0, g_tcache.exact_tile_bins.nbytes()) value:0];
+        [blit endEncoding];
+
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        assert(enc && "Failed to create compute command encoder");
+
+        NSUInteger map_tpg = MIN(ctx->map_gaussian_to_intersects_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
+        [enc setComputePipelineState:ctx->map_gaussian_to_intersects_kernel_cpso];
+        ENC_SCALAR(enc, num_points_u32, 0); ENC_BUF(enc, g_tcache.xys, 1); ENC_BUF(enc, g_tcache.depths, 2);
+        ENC_BUF(enc, g_tcache.radii_out, 3); ENC_BUF(enc, g_tcache.num_tiles_hit, 4);
+        [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:5];
+        ENC_SCALAR(enc, capacity_u32, 6);
+        ENC_BUF(enc, g_tcache.exact_isect_ids, 7); ENC_BUF(enc, g_tcache.exact_gaussian_ids, 8);
+        ENC_BUF(enc, g_tcache.aabb, 9); ENC_BUF(enc, g_tcache.overflow_flag, 10);
+        [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(map_tpg, 1, 1)];
+
+        MTensor* keys_in = &g_tcache.exact_isect_ids;
+        MTensor* keys_out = &g_tcache.exact_isect_ids_tmp;
+        MTensor* vals_in = &g_tcache.exact_gaussian_ids;
+        MTensor* vals_out = &g_tcache.exact_gaussian_ids_tmp;
+        for (uint32_t shift = 0; shift < 64; shift += 8) {
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [enc setComputePipelineState:ctx->radix_sort_histogram_kernel_cpso];
+            ENC_SCALAR(enc, capacity_u32, 0); [enc setBuffer:(*keys_in).buffer() offset:0 atIndex:1]; ENC_BUF(enc, g_tcache.exact_radix_counts, 2);
+            ENC_SCALAR(enc, shift, 3); ENC_BUF(enc, g_tcache.num_tiles_hit, 4); ENC_SCALAR(enc, num_points_u32, 5);
+            [enc dispatchThreadgroups:MTLSizeMake(num_blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [enc setComputePipelineState:ctx->radix_sort_scan_kernel_cpso];
+            ENC_BUF(enc, g_tcache.exact_radix_counts, 0); ENC_SCALAR(enc, num_blocks, 1);
+            ENC_BUF(enc, g_tcache.num_tiles_hit, 2); ENC_SCALAR(enc, capacity_u32, 3); ENC_SCALAR(enc, num_points_u32, 4);
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [enc setComputePipelineState:ctx->radix_sort_scatter_kernel_cpso];
+            ENC_SCALAR(enc, capacity_u32, 0); [enc setBuffer:(*keys_in).buffer() offset:0 atIndex:1]; [enc setBuffer:(*vals_in).buffer() offset:0 atIndex:2];
+            [enc setBuffer:(*keys_out).buffer() offset:0 atIndex:3]; [enc setBuffer:(*vals_out).buffer() offset:0 atIndex:4]; ENC_BUF(enc, g_tcache.exact_radix_counts, 5);
+            ENC_SCALAR(enc, shift, 6); ENC_BUF(enc, g_tcache.num_tiles_hit, 7); ENC_SCALAR(enc, num_points_u32, 8);
+            [enc dispatchThreadgroups:MTLSizeMake(num_blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+            std::swap(keys_in, keys_out);
+            std::swap(vals_in, vals_out);
+        }
+
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        [enc setComputePipelineState:ctx->get_tile_bin_edges_kernel_cpso];
+        ENC_SCALAR(enc, capacity_u32, 0); [enc setBuffer:(*keys_in).buffer() offset:0 atIndex:1]; ENC_BUF(enc, g_tcache.exact_tile_bins, 2);
+        ENC_BUF(enc, g_tcache.num_tiles_hit, 3); ENC_SCALAR(enc, num_points_u32, 4);
+        [enc dispatchThreads:MTLSizeMake(capacity_u32, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        [enc setComputePipelineState:ctx->pack_sorted_gaussians_kernel_cpso];
+        [enc setBuffer:(*vals_in).buffer() offset:0 atIndex:0]; ENC_BUF(enc, g_tcache.xys, 1); ENC_BUF(enc, g_tcache.conics, 2);
+        ENC_BUF(enc, g_tcache.colors, 3); [enc setBuffer:(*pending.opacities).buffer() offset:0 atIndex:4];
+        ENC_BUF(enc, g_tcache.exact_packed_xy_opac, 5); ENC_BUF(enc, g_tcache.exact_packed_conic, 6);
+        ENC_BUF(enc, g_tcache.exact_packed_rgb, 7); ENC_SCALAR(enc, capacity_u32, 8);
+        ENC_BUF(enc, g_tcache.num_tiles_hit, 9); ENC_SCALAR(enc, num_points_u32, 10);
+        [enc dispatchThreads:MTLSizeMake(capacity_u32, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+        [enc endEncoding];
+    });
+    ctx->syncCB();
+
+    int* tile_bins = g_tcache.exact_tile_bins.data<int>();
+    uint32_t max_tile_count = 0;
+    for (int tile = 0; tile < num_tiles; ++tile) {
+        int start = tile_bins[2 * tile + 0];
+        int end = tile_bins[2 * tile + 1];
+        if (end > start) max_tile_count = std::max(max_tile_count, (uint32_t)(end - start));
+    }
+    if (max_tile_count == 0) return 0;
+
+    command_buffer = ctx->getCommandBuffer();
+    assert(command_buffer && "Failed to retrieve command buffer reference");
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+        [blit fillBuffer:g_tcache.overflow_tile_flags.buffer() range:NSMakeRange(0, g_tcache.overflow_tile_flags.nbytes()) value:1];
+        [blit endEncoding];
+    });
+    ctx->syncCB();
+
+    encode_exact_overflow_raster(ctx, pending, max_tile_count);
+    ctx->syncCB();
+    return max_tile_count;
+}
+
 static void msplat_maybe_run_overflow_fallback_after_sync(MetalContext* ctx) {
     if (!g_pending_render_fallback.active || !g_tcache.overflow_flag.defined()) {
         return;
@@ -848,19 +1031,31 @@ static void msplat_maybe_run_overflow_fallback_after_sync(MetalContext* ctx) {
 
     static bool info_printed = false;
     if (!info_printed) {
-        fprintf(stderr, "msplat: per-tile overflow detected; exact-rerendering overflow tiles.\n");
+        fprintf(stderr, "msplat: per-tile overflow detected; rerendering overflow tiles.\n");
         info_printed = true;
     }
 
-    uint32_t max_tile_count = build_exact_overflow_bins_cpu(ctx, pending);
+    uint32_t max_tile_count = 0;
+    if (pending.use_gpu_radix) {
+        static bool radix_info_printed = false;
+        if (!radix_info_printed) {
+            fprintf(stderr, "msplat: per-tile overflow detected; exact-rerendering with gpu radix sort.\n");
+            radix_info_printed = true;
+        }
+        max_tile_count = run_gpu_radix_overflow_fallback(ctx, pending);
+    } else {
+        max_tile_count = build_exact_overflow_bins_cpu(ctx, pending);
+    }
     if (max_tile_count == 0) {
         fprintf(stderr, "msplat: exact overflow fallback failed; keeping fast-path render.\n");
         return;
     }
     g_last_overflow_max_tile_count = max_tile_count;
 
-    encode_exact_overflow_raster(ctx, pending, max_tile_count);
-    ctx->syncCB();
+    if (!pending.use_gpu_radix) {
+        encode_exact_overflow_raster(ctx, pending, max_tile_count);
+        ctx->syncCB();
+    }
     *g_tcache.overflow_flag.data<int32_t>() = 0;
     ++g_overflow_fallback_count;
 }
@@ -1191,7 +1386,8 @@ MTensor msplat_render(
     unsigned degree, unsigned degrees_to_use, float cam_pos[3],
     MTensor &features_dc, MTensor &features_rest,
     MTensor &opacities, MTensor &background,
-    bool exact_overflow
+    bool exact_overflow,
+    bool radix_overflow
 ) {
     MTensor dummyGt, dummyWindow;
     forward_pipeline(num_points, means3d, scales, glob_scale,
@@ -1199,8 +1395,9 @@ MTensor msplat_render(
         img_height, img_width, tile_bounds, clip_thresh,
         degree, degrees_to_use, cam_pos, features_dc, features_rest,
         opacities, background, dummyGt, dummyWindow, 0.0f, false, false);
-    if (exact_overflow) {
+    if (exact_overflow || radix_overflow) {
         g_pending_render_fallback.active = true;
+        g_pending_render_fallback.use_gpu_radix = radix_overflow;
         g_pending_render_fallback.img_height = img_height;
         g_pending_render_fallback.img_width = img_width;
         g_pending_render_fallback.tile_bounds_x = (uint32_t)std::get<0>(tile_bounds);
@@ -1211,6 +1408,7 @@ MTensor msplat_render(
         g_pending_render_fallback.render_depth = false;
     } else {
         g_pending_render_fallback.active = false;
+        g_pending_render_fallback.use_gpu_radix = false;
     }
     return g_tcache.out_img;
 }
@@ -1224,7 +1422,8 @@ std::tuple<MTensor, MTensor> msplat_render_depth(
     unsigned degree, unsigned degrees_to_use, float cam_pos[3],
     MTensor &features_dc, MTensor &features_rest,
     MTensor &opacities, MTensor &background,
-    bool exact_overflow
+    bool exact_overflow,
+    bool radix_overflow
 ) {
     MTensor dummyGt, dummyWindow;
     forward_pipeline(num_points, means3d, scales, glob_scale,
@@ -1232,8 +1431,9 @@ std::tuple<MTensor, MTensor> msplat_render_depth(
         img_height, img_width, tile_bounds, clip_thresh,
         degree, degrees_to_use, cam_pos, features_dc, features_rest,
         opacities, background, dummyGt, dummyWindow, 0.0f, false, true);
-    if (exact_overflow) {
+    if (exact_overflow || radix_overflow) {
         g_pending_render_fallback.active = true;
+        g_pending_render_fallback.use_gpu_radix = radix_overflow;
         g_pending_render_fallback.img_height = img_height;
         g_pending_render_fallback.img_width = img_width;
         g_pending_render_fallback.tile_bounds_x = (uint32_t)std::get<0>(tile_bounds);
@@ -1244,6 +1444,7 @@ std::tuple<MTensor, MTensor> msplat_render_depth(
         g_pending_render_fallback.render_depth = true;
     } else {
         g_pending_render_fallback.active = false;
+        g_pending_render_fallback.use_gpu_radix = false;
     }
     return {g_tcache.out_depth, g_tcache.out_alpha};
 }

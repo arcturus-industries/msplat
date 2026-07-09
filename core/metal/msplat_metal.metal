@@ -1072,10 +1072,7 @@ kernel void map_gaussian_to_intersects_kernel(
 
     // update the intersection info for all tiles this gaussian hits
     int32_t cur_idx = (idx == 0) ? 0 : num_tiles_hit[idx - 1];
-    // Compressed sort key: tile_id in bits [16:31], upper 16 bits of float depth in bits [0:15].
-    // Upper 16 bits of positive float preserve ordering (sign+exponent+7 mantissa bits).
-    // Reduces effective key width from ~48 to ~28 bits → 4 radix passes instead of 6.
-    int64_t depth_16 = ((int64_t) * (constant int32_t *)&(depths[idx])) >> 16;
+    uint64_t depth_bits = (uint64_t)as_type<uint>(depths[idx]);
     for (int i = tile_min.y; i < tile_max.y; ++i) {
         for (int j = tile_min.x; j < tile_max.x; ++j) {
             if ((uint)cur_idx >= capacity) {
@@ -1083,7 +1080,7 @@ kernel void map_gaussian_to_intersects_kernel(
                 return;
             }
             int64_t tile_id = i * tile_bounds.x + j;
-            isect_ids[cur_idx] = (tile_id << 16) | (depth_16 & 0xFFFF);
+            isect_ids[cur_idx] = (tile_id << 32) | (int64_t)depth_bits;
             gaussian_ids[cur_idx] = idx;                     // 3D gaussian id
             ++cur_idx; // handles gaussians that hit more than one tile
         }
@@ -1104,8 +1101,7 @@ kernel void get_tile_bin_edges_kernel(
     if (idx >= num_intersects)
         return;
     // save the indices where the tile_id changes
-    // Extract tile_id from compressed key: tile_id is in bits [16:]
-    int32_t cur_tile_idx = (int32_t)(isect_ids_sorted[idx] >> 16);
+    int32_t cur_tile_idx = (int32_t)(isect_ids_sorted[idx] >> 32);
     if (idx == 0 || idx == num_intersects - 1) {
         if (idx == 0)
             write_packed_int2x(tile_bins, cur_tile_idx, 0);
@@ -1113,7 +1109,7 @@ kernel void get_tile_bin_edges_kernel(
             write_packed_int2y(tile_bins, cur_tile_idx, num_intersects);
         return;
     }
-    int32_t prev_tile_idx = (int32_t)(isect_ids_sorted[idx - 1] >> 16);
+    int32_t prev_tile_idx = (int32_t)(isect_ids_sorted[idx - 1] >> 32);
     if (prev_tile_idx != cur_tile_idx) {
         write_packed_int2y(tile_bins, prev_tile_idx, idx);
         write_packed_int2x(tile_bins, cur_tile_idx, idx);

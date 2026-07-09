@@ -18,6 +18,7 @@
 #include <random>
 #include <optional>
 #include <tuple>
+#include <utility>
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -289,10 +290,14 @@ public:
     std::unique_ptr<Model> model;
     std::vector<float> background;
     bool exact_overflow = false;
+    bool radix_overflow = false;
 
     GaussianRenderer(const std::string &ply_path, std::vector<float> bg_color, const std::string &overflow_mode)
-        : background(validate_bg_color(bg_color)), exact_overflow(validate_overflow_mode(overflow_mode))
+        : background(validate_bg_color(bg_color))
     {
+        auto overflow = validate_overflow_mode(overflow_mode);
+        exact_overflow = overflow.first;
+        radix_overflow = overflow.second;
         InputData input;
         input.scale = 1.0f;
         input.translation[0] = input.translation[1] = input.translation[2] = 0.0f;
@@ -340,10 +345,11 @@ public:
         return nb::cast(nb::ndarray<nb::numpy, float>(buf, 2, shape, deleter));
     }
 
-    static bool validate_overflow_mode(const std::string &overflow_mode) {
-        if (overflow_mode == "fast") return false;
-        if (overflow_mode == "exact") return true;
-        throw std::invalid_argument("overflow_mode must be 'fast' or 'exact'");
+    static std::pair<bool, bool> validate_overflow_mode(const std::string &overflow_mode) {
+        if (overflow_mode == "fast") return {false, false};
+        if (overflow_mode == "exact") return {true, false};
+        if (overflow_mode == "radix") return {false, true};
+        throw std::invalid_argument("overflow_mode must be 'fast', 'exact', or 'radix'");
     }
 
     void set_background(const std::vector<float> &bg_color) {
@@ -381,7 +387,7 @@ public:
         memcpy(cam.camToWorld, cam_to_world.data(), 16 * sizeof(float));
 
         int degree_step = std::clamp(max_sh_degree, 0, model->shDegree);
-        MTensor rgb = model->render(cam, degree_step, exact_overflow);
+        MTensor rgb = model->render(cam, degree_step, exact_overflow, radix_overflow);
         msplat_gpu_sync();
         MTensor rgb_cpu = rgb.cpu();
 
@@ -422,7 +428,7 @@ public:
         memcpy(cam.camToWorld, cam_to_world.data(), 16 * sizeof(float));
 
         int degree_step = std::clamp(max_sh_degree, 0, model->shDegree);
-        auto rendered = model->renderDepth(cam, degree_step, exact_overflow);
+        auto rendered = model->renderDepth(cam, degree_step, exact_overflow, radix_overflow);
         msplat_gpu_sync();
         MTensor depth = std::get<0>(rendered);
         MTensor alpha = std::get<1>(rendered);

@@ -357,6 +357,45 @@ def test_gaussian_renderer_exact_overflow_mode_repairs_tiles():
 
 
 @pytest.mark.skipif(platform.system() != "Darwin", reason="GaussianRenderer requires Metal")
+def test_gaussian_renderer_radix_overflow_mode_repairs_tiles():
+    """Radix overflow mode rerenders overfull tiles through the GPU global sort path."""
+    from msplat import (
+        GaussianRenderer,
+        last_overflow_max_tile_count,
+        last_overflow_tile_count,
+        overflow_fallback_count,
+        reset_overflow_fallback_count,
+    )
+
+    with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as f:
+        path = f.name
+
+    try:
+        _write_overflow_gaussian_ply(path, count=3000)
+        reset_overflow_fallback_count()
+        renderer = GaussianRenderer(path, bg_color=[0.0, 0.0, 0.0], overflow_mode="radix")
+        pose = np.eye(4, dtype=np.float32)
+        img = renderer.render(
+            pose,
+            64,
+            64,
+            48.0,
+            48.0,
+            32.0,
+            32.0,
+            max_sh_degree=0,
+        )
+
+        assert img.shape == (64, 64, 3)
+        assert np.isfinite(img).all()
+        assert overflow_fallback_count() >= 1
+        assert last_overflow_tile_count() >= 1
+        assert last_overflow_max_tile_count() >= 3000
+    finally:
+        os.unlink(path)
+
+
+@pytest.mark.skipif(platform.system() != "Darwin", reason="GaussianRenderer requires Metal")
 def test_gaussian_renderer_exact_depth_does_not_pollute_rgb_state():
     """Depth exact-overflow fallback must not corrupt following RGB renders."""
     from msplat import GaussianRenderer, reset_overflow_fallback_count
